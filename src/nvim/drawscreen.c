@@ -99,6 +99,7 @@
 #include "nvim/normal_defs.h"
 #include "nvim/option.h"
 #include "nvim/option_vars.h"
+#include "nvim/os/os.h"
 #include "nvim/os/os_defs.h"
 #include "nvim/plines.h"
 #include "nvim/popupmenu.h"
@@ -1374,6 +1375,41 @@ static void draw_sep_connectors_win(win_T *wp)
   }
 }
 
+// Large viewport jumps bypass grid scrolling and replace every row. Notify the
+// opt-in terminal before replacement, retaining one bounded viewport of content.
+static void kitty_smooth_jump(win_T *wp)
+{
+  if (os_getenv("NVIM_KITTY_SMOOTH") == NULL
+      || !wp->w_lines[0].wl_valid || wp->w_lines[0].wl_lnum == wp->w_topline) {
+    return;
+  }
+  int row = 0;
+  int col = 0;
+  ScreenGrid *grid = grid_adjust(&wp->w_grid, &row, &col);
+  if (wp->w_view_height <= 0 || wp->w_view_width <= 0) {
+    return;
+  }
+  int height = MIN(wp->w_view_height, grid->rows - row);
+  int width = MIN(wp->w_view_width, grid->cols - col);
+  if (height <= 0 || width <= 0) {
+    return;
+  }
+  int delta = wp->w_topline > wp->w_lines[0].wl_lnum ? height : -height;
+  row += grid->comp_row;
+  col += grid->comp_col;
+  int bottom = MIN(row + height, Rows);
+  int right = MIN(col + width, Columns);
+  row = MAX(row, 0);
+  col = MAX(col, 0);
+  if (row >= bottom || col >= right) {
+    return;
+  }
+  char sequence[128];
+  int len = snprintf(sequence, sizeof(sequence), "\x1b]9923;%d;%d;%d;%d;%d;%d\x1b\\",
+                     wp->handle, row, bottom, col, right, delta);
+  ui_call_ui_send((String){ .data = sequence, .size = (size_t)len });
+}
+
 /// Update a single window.
 ///
 /// This may cause the windows below it also to be redrawn (when clearing the
@@ -1736,9 +1772,11 @@ static void win_update(win_T *wp)
             }
           }
         } else {
+          kitty_smooth_jump(wp);
           mid_start = 0;  // redraw all lines
         }
       } else {
+        kitty_smooth_jump(wp);
         mid_start = 0;  // redraw all lines
       }
     } else {
@@ -1760,6 +1798,7 @@ static void win_update(win_T *wp)
       if (j == -1) {
         // if wp->w_topline is not in wp->w_lines[].wl_lnum redraw all
         // lines
+        kitty_smooth_jump(wp);
         mid_start = 0;
       } else {
         // Try to delete the correct number of lines.

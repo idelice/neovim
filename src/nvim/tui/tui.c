@@ -572,6 +572,9 @@ static void terminfo_start(TUIData *tui)
   // Enter alternate screen, save title, and clear.
   // NOTE: Do this *before* changing terminal settings. #6433
   terminfo_out(tui, kTerm_enter_ca_mode);
+  if (os_getenv("NVIM_KITTY_SMOOTH") != NULL) {
+    out(tui, S_LEN("\x1b]9912;1\x1b\\"));
+  }
   terminfo_out(tui, kTerm_keypad_xmit);
   terminfo_out(tui, kTerm_clear_screen);
 
@@ -1356,7 +1359,7 @@ void tui_grid_resize(TUIData *tui, Integer g, Integer width, Integer height)
     r->right = MIN(r->right, grid->width);
   }
 
-  if (tui->pending_resize_events == 0 && !tui->is_starting) {
+  if (tui->pending_resize_events == 0 && !tui->is_starting && tui->can_resize_screen) {
     // Resize the _host_ terminal.
     out_printf(tui, 64, "\x1b[8;%d;%dt", (int)height, (int)width);
   } else {  // Already handled the resize; avoid double-resize.
@@ -1692,7 +1695,8 @@ void tui_default_colors_set(TUIData *tui, Integer rgb_fg, Integer rgb_bg, Intege
 void tui_ui_send(TUIData *tui, String content)
   FUNC_ATTR_NONNULL_ALL
 {
-  if (kv_size(tui->invalid_regions) || tui->bufpos > 0) {
+  if (kv_size(tui->invalid_regions) || tui->bufpos > 0
+      || os_getenv("NVIM_KITTY_SMOOTH") != NULL) {
     // Append to buffer instead of writing directly.
     out(tui, content.data, content.size);
     return;
@@ -2456,11 +2460,13 @@ static void augment_terminfo(TUIData *tui, const char *term, int vte_version, in
   bool true_xterm = xterm && !!xterm_version && !bsdvt;
 
   // Only define this capability for terminal types that we know understand it.
-  if (dtterm         // originated this extension
-      || xterm       // per xterm ctlseqs doco
-      || konsolev    // per commentary in VT102Emulation.cpp
-      || teraterm    // per TeraTerm "Supported Control Functions" doco
-      || rxvt) {     // per command.C
+  // Kitty's xterm-family name does not imply support for host-window resizing.
+  if (!kitty && os_getenv("NVIM_KITTY_SMOOTH") == NULL
+      && (dtterm     // originated this extension
+          || xterm   // per xterm ctlseqs doco
+          || konsolev
+          || teraterm
+          || rxvt)) {     // per command.C
     tui->can_resize_screen = true;
   }
 

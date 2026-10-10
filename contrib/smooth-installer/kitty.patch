@@ -1,0 +1,2021 @@
+diff --git a/bypy/devenv.go b/bypy/devenv.go
+index 0b17d9bd0..d281404c1 100644
+--- a/bypy/devenv.go
++++ b/bypy/devenv.go
+@@ -106,6 +106,9 @@ func get_dependencies(path string) (ans []dependency) {
+ 
+ func get_local_dependencies(path string) (ans []dependency) {
+ 	for _, dep := range get_dependencies(path) {
++		if dep.is_id && strings.HasPrefix(dep.path, "@rpath/") {
++			continue
++		}
+ 		for _, y := range []string{filepath.Join(macos_prefix, "lib") + "/", filepath.Join(macos_prefix, "python", "Python.framework") + "/", "@rpath/"} {
+ 			if strings.HasPrefix(dep.path, y) {
+ 				if y == "@rpath/" {
+@@ -126,9 +129,15 @@ func change_dep(path string, dep dependency) {
+ 	cmd := []string{}
+ 	fid := filepath.Join(root_dir(), dep.basename)
+ 	if dep.is_id {
+-		cmd = append(cmd, "-id", fid)
++		cmd = append(cmd, "-id", "@rpath/"+dep.basename)
+ 	} else {
+-		cmd = append(cmd, "-change", dep.path, fid)
++		// Executables may not have header padding for long installation paths.
++		// Resolve dependencies relative to this Mach-O rather than the checkout.
++		relative, err := filepath.Rel(filepath.Dir(path), fid)
++		if err != nil {
++			exit(err)
++		}
++		cmd = append(cmd, "-change", dep.path, "@loader_path/"+relative)
+ 	}
+ 	cmd = append(cmd, path)
+ 	c := exec.Command("install_name_tool", cmd...)
+diff --git a/kitty/child-monitor.c b/kitty/child-monitor.c
+index 483e53cb8..4946b78ee 100644
+--- a/kitty/child-monitor.c
++++ b/kitty/child-monitor.c
+@@ -938,6 +938,24 @@ prepare_to_render_os_window(
+                     set_maximum_wait(min_gap);
+                 }
+             }
++            if (!WD.screen->paused_rendering.expires_at && screen_tui_scene_tick(WD.screen, now)) {
++                needs_render = true;
++                set_maximum_wait(ms_to_monotonic_t(USE_RENDER_FRAMES ? 250 : 4));
++            }
++            if (!WD.screen->paused_rendering.expires_at && screen_tui_pane_scroll_tick(WD.screen, now)) {
++                needs_render = true;
++                set_maximum_wait(ms_to_monotonic_t(USE_RENDER_FRAMES ? 250 : 4));
++            }
++            if (!WD.screen->paused_rendering.expires_at && WD.screen->tui_scroll.started_at) {
++                needs_render = true;
++                float position, velocity;
++                screen_tui_scroll_sample(WD.screen, now, &position, &velocity);
++                if (WD.screen->linebuf != WD.screen->alt_linebuf ||
++                    (fabsf(position) < 0.001f && fabsf(velocity) < 0.02f && now >= WD.screen->tui_scroll.started_at)) {
++                    WD.screen->tui_scroll.started_at = 0;
++                    WD.screen->tui_scroll.offset = WD.screen->tui_scroll.velocity = 0.f;
++                } else set_maximum_wait(ms_to_monotonic_t(USE_RENDER_FRAMES ? 250 : 4));
++            }
+             if (send_cell_data_to_gpu(WD.vao_idx, WD.screen, os_window)) needs_render = true;
+             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) needs_render = true;
+             if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) needs_render = true;
+@@ -1130,12 +1148,33 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
+     return needs_render;
+ }
+ 
++// A ready display callback is already paced by the compositor. Do not let
++// the terminal's normal batching delay cap native motion below display refresh.
++static bool
++tui_animation_frame_ready(void) {
++    if (!USE_RENDER_FRAMES) return false;
++    for (size_t i = 0; i < global_state.num_os_windows; i++) {
++        OSWindow *w = global_state.os_windows + i;
++        if (w->render_state != RENDER_FRAME_READY) continue;
++        if (w->active_tab >= w->num_tabs) continue;
++        Tab *tab = w->tabs + w->active_tab;
++        for (size_t n = 0; n < tab->num_windows; n++) {
++            Window *window = tab->windows + n;
++            Screen *s = window->render_data.screen;
++            if (!window->visible || !s || !s->tui_scroll.enabled || s->paused_rendering.expires_at || s->linebuf != s->alt_linebuf) continue;
++            if (s->tui_scene.cursor_moving || s->tui_scroll.started_at || screen_tui_windows_active(s)) return true;
++            for (unsigned p = 0; p < TUI_WINDOW_SLOTS; p++) if (s->tui_pane_scroll[p].started_at) return true;
++        }
++    }
++    return false;
++}
++
+ static void
+ render(monotonic_t now, bool input_read) {
+     EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
+     static monotonic_t last_render_at = MONOTONIC_T_MIN;
+     monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
+-    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window) {
++    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window && !tui_animation_frame_ready()) {
+         set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
+         return;
+     }
+diff --git a/kitty/child.py b/kitty/child.py
+index 560a60040..be5c0a617 100644
+--- a/kitty/child.py
++++ b/kitty/child.py
+@@ -382,6 +382,7 @@ def get_final_env(self) -> tuple[dict[str, str], bool]:
+         env['TERM'] = opts.term
+         env['COLORTERM'] = 'truecolor'
+         env['KITTY_PID'] = getpid()
++        env['KITTY_SMOOTH_NVIM'] = '1'
+         env['KITTY_PUBLIC_KEY'] = boss.encryption_public_key
+         if self.remote_control_fd > -1:
+             env['KITTY_LISTEN_ON'] = f'fd:{self.remote_control_fd}'
+diff --git a/kitty/cursor_trail.c b/kitty/cursor_trail.c
+index e2a4eae68..04100481b 100644
+--- a/kitty/cursor_trail.c
++++ b/kitty/cursor_trail.c
+@@ -72,6 +72,15 @@ record_cursor_move(CursorTrail *ct, monotonic_t now) {
+ 
+ static bool
+ should_skip_cursor_trail_update(CursorTrail *ct, ndc_coords g, OSWindow *os_window, Window *w) {
++    if (WD.screen->tui_layers.active &&
++        (WD.screen->tui_scene.cursor_layout_changed ||
++         WD.screen->tui_layers.focused_owner_id != WD.screen->tui_scene.cursor_owner_id ||
++         screen_tui_windows_active(WD.screen))) {
++        // A native layout/focus handoff is not cursor travel. Snap Kitty's
++        // existing trail corners so the overlay cannot bridge separate panes.
++        return true;
++    }
++
+     if (os_window->live_resize.in_progress) { return true; }
+ 
+     if (!WD.screen->modes.mDECTCEM && ct->opacity <= 0.0f) { return true; }
+diff --git a/kitty/fast_data_types.pyi b/kitty/fast_data_types.pyi
+index 65a30b1bc..fcb0de954 100644
+--- a/kitty/fast_data_types.pyi
++++ b/kitty/fast_data_types.pyi
+@@ -1061,6 +1061,17 @@ class Cursor:
+     shape: int
+ 
+ class Screen:
++    tui_scroll_cache: Optional[LineBuf]
++    tui_scroll_state: tuple[float, float, int, int]
++
++    tui_scene_snapshot: LineBuf | None
++    tui_layers_active: bool
++    def test_tui_layer(self, layer_id: int) -> tuple[LineBuf, int, int, int, int, int] | None: ...
++    def test_tui_window_sample(self, seconds: float, window_id: int = 0) -> tuple[float, float, float, float, int]: ...
++    def test_tui_cursor(self, seconds: float, x: int, y: int) -> tuple[float, float, bool]: ...
++    def test_tui_pane_scroll(self, owner_id: int, seconds: float = -1) -> tuple[float, float, int, int, int, int, LineBuf, int] | None: ...
++    def test_tui_window_size(self, seconds: float, window_id: int) -> tuple[float, float, float, float, bool] | None: ...
++    def test_tui_scroll_sample(self, seconds: float) -> tuple[float, float]: ...
+     color_profile: ColorProfile
+     columns: int
+     lines: int
+diff --git a/kitty/mouse.c b/kitty/mouse.c
+index 512b612db..ee1ee3397 100644
+--- a/kitty/mouse.c
++++ b/kitty/mouse.c
+@@ -1643,6 +1643,40 @@ scroll_event(const GLFWScrollEvent *ev) {
+             osw->scroll.pending_pixels_y = 0.0;
+             if (screen_apply_pixel_scroll(screen, delta_pixels) && screen->selections.in_progress) update_drag(w);
+         } else {
++            if (screen->tui_scroll.enabled && screen->linebuf == screen->alt_linebuf &&
++                screen->modes.mouse_tracking_mode &&
++                (!screen->tui_scroll.bottom || (w->mouse_pos.cell_x >= screen->tui_scroll.left && w->mouse_pos.cell_x < screen->tui_scroll.right &&
++                    w->mouse_pos.cell_y >= screen->tui_scroll.top && w->mouse_pos.cell_y < screen->tui_scroll.bottom)) &&
++                ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES && OPT(touch_scroll_multiplier) != 0) {
++                monotonic_t now = monotonic();
++                double cell_height = global_state.callback_os_window->fonts_data->fcm.cell_height;
++                double pixels = ev->y_offset * (OPT(touch_scroll_multiplier) < 0 ? -1. : 1.);
++                TUIScrollContext *pane = NULL;
++                unsigned pane_priority = 0;
++                for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++                    TUIScrollContext *c = &screen->tui_pane_scroll[i];
++                    if (!c->owner_id || w->mouse_pos.cell_x < c->left || w->mouse_pos.cell_x >= c->right || w->mouse_pos.cell_y < c->top || w->mouse_pos.cell_y >= c->bottom) continue;
++                    for (unsigned j = 0; j < TUI_WINDOW_SLOTS; j++) {
++                        const TUIWindowMotion *owner = &screen->tui_scene.windows[j];
++                        unsigned priority = owner->priority * TUI_WINDOW_SLOTS + j;
++                        if (owner->open_id == c->owner_id && !owner->closing && (!pane || priority >= pane_priority)) { pane = c; pane_priority = priority; }
++                    }
++                }
++                if (pane) {
++                    float position, velocity;
++                    screen_tui_pane_scroll_sample(pane, now, &position, &velocity);
++                    float limit = (float)(pane->bottom - pane->top);
++                    pane->offset = MAX(-limit, MIN(limit, position + (float)(pixels / cell_height)));
++                    pane->velocity = 0.f; pane->last_input_at = now;
++                    pane->started_at = now + ms_to_monotonic_t(80);
++                }
++                float offset = screen_tui_scroll_offset(screen, now) + (float)(pixels / cell_height);
++                screen->tui_scroll.offset = MAX(-(float)screen->lines, MIN((float)screen->lines, offset));
++                screen->tui_scroll.velocity = 0.f;
++                screen->tui_scroll.last_input_at = now;
++                screen->tui_scroll.started_at = now + ms_to_monotonic_t(80);
++                screen->is_dirty = true;
++            }
+             int s = scale_scroll(
+                 screen->modes.mouse_tracking_mode,
+                 ev->y_offset,
+diff --git a/kitty/screen.c b/kitty/screen.c
+index f0af2419f..ca371bfe7 100644
+--- a/kitty/screen.c
++++ b/kitty/screen.c
+@@ -208,6 +208,8 @@ static Line *range_line_(Screen *self, int y);
+ 
+ static void
+ do_screen_reset(Screen *self, bool is_hard_reset) {
++    screen_tui_scene_reset(self);
++    screen_tui_scroll_reset(self);
+     screen_pause_rendering(self, false, 0);
+     self->dnd_chunking.active = false;
+     self->extra_cursors.count = 0;
+@@ -642,6 +644,10 @@ remove_blank_output_line_reservation_marker(Cursor *cursor, LineBuf *linebuf) {
+ 
+ static bool
+ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
++    screen_tui_scene_reset(self);
++    bool smooth_enabled = self->tui_scroll.enabled;
++    screen_tui_scroll_reset(self);
++    self->tui_scroll.enabled = smooth_enabled;
+     screen_pause_rendering(self, false, 0);
+     lines = MAX(1u, lines);
+     columns = MAX(1u, columns);
+@@ -805,6 +811,15 @@ dealloc(Screen *self) {
+     Py_CLEAR(self->overlay_line.overlay_text);
+     PyMem_Free(self->main_tabstops);
+     Py_CLEAR(self->paused_rendering.linebuf);
++    Py_CLEAR(self->tui_scene.snapshot);
++    Py_CLEAR(self->tui_layers.discard);
++    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
++        Py_CLEAR(self->tui_layers.layers[i].current);
++        Py_CLEAR(self->tui_layers.layers[i].pending);
++    }
++    Py_CLEAR(self->tui_scroll.retained);
++    Py_CLEAR(self->tui_scroll.scratch);
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) { screen_tui_pane_scroll_clear(&self->tui_pane_scroll[i]); screen_tui_pane_scroll_clear(&self->tui_frozen_scroll[i]); }
+     Py_CLEAR(self->paused_rendering.grman);
+     free(self->selections.items);
+     free(self->url_ranges.items);
+@@ -1096,6 +1111,20 @@ screen_garbage_collect_text_cache(Screen *self) {
+     text_cache_gc_process_linebuf(self->text_cache, gc, self->main_linebuf);
+     text_cache_gc_process_linebuf(self->text_cache, gc, self->alt_linebuf);
+     text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.linebuf);
++    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_scene.snapshot);
++    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.discard);
++    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
++        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.layers[i].current);
++        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.layers[i].pending);
++    }
++    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_scroll.retained);
++    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_scroll.scratch);
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_pane_scroll[i].retained);
++        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_pane_scroll[i].scratch);
++        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_pane_scroll[i].frame_source);
++        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_frozen_scroll[i].retained);
++    }
+     if (self->overlay_line.cpu_cells) text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.cpu_cells, self->overlay_line.xnum);
+     if (self->overlay_line.original_line.cpu_cells)
+         text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.original_line.cpu_cells, self->overlay_line.xnum);
+@@ -1956,6 +1985,8 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
+ void
+ screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_screen) {
+     bool to_alt = self->linebuf == self->main_linebuf;
++    screen_tui_scene_reset(self);
++    screen_tui_scroll_reset(self);
+     self->active_hyperlink_id = 0;
+     reset_pixel_scroll(self, 0);
+     if (to_alt) {
+@@ -3812,11 +3843,27 @@ copy_selections(Selections *dest, const Selections *src) {
+     return true;
+ }
+ 
++static void
++resume_tui_clock(monotonic_t *clock, monotonic_t started_at, monotonic_t now) {
++    if (*clock) *clock = *clock >= started_at ? now : *clock + now - started_at;
++}
++
+ bool
+ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
+     if (!pause) {
+         if (!self->paused_rendering.expires_at) return false;
++        if (self->tui_update_started_at && self->tui_scroll.enabled) {
++            monotonic_t now = monotonic();
++            resume_tui_clock(&self->tui_scroll.started_at, self->tui_update_started_at, now);
++            for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) resume_tui_clock(&self->tui_pane_scroll[i].started_at, self->tui_update_started_at, now);
++            resume_tui_clock(&self->tui_scene.started_at, self->tui_update_started_at, now);
++            resume_tui_clock(&self->tui_scene.cursor_at, self->tui_update_started_at, now);
++            for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) resume_tui_clock(&self->tui_scene.windows[i].open_at, self->tui_update_started_at, now);
++        }
++        self->tui_update_started_at = 0;
+         self->paused_rendering.expires_at = 0;
++        if (self->tui_layers.pending_commit) screen_tui_layers_commit(self);
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) screen_tui_pane_scroll_clear(&self->tui_frozen_scroll[i]);
+         // ensure cell data is updated on GPU
+         self->is_dirty = true;
+         // ensure selection data is updated on GPU
+@@ -3834,7 +3881,40 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
+     if (!self->paused_rendering.grman) self->paused_rendering.grman = grman_alloc(true);
+     if (!self->paused_rendering.grman) return false;
+     if (for_in_ms <= 0) for_in_ms = 2000;
+-    self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
++    self->tui_layers.frozen = self->tui_layers.active && !self->reload_all_gpu_data;
++    if (self->tui_layers.frozen) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) screen_tui_pane_scroll_clear(&self->tui_frozen_scroll[i]);
++        memcpy(self->tui_frozen_scroll, self->tui_pane_scroll, sizeof(self->tui_frozen_scroll));
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            TUIScrollContext *c = &self->tui_frozen_scroll[i];
++            LineBuf *src = c->retained;
++            c->retained = c->scratch = c->frame_source = NULL;
++            if (src) {
++                c->retained = alloc_linebuf(src->ynum, src->xnum, self->text_cache);
++                if (c->retained) for (unsigned y = 0; y < src->ynum; y++) {
++                    linebuf_init_line(src, y); linebuf_copy_line_to(c->retained, src->line, y);
++                } else { PyErr_Clear(); self->tui_layers.frozen = false; }
++            }
++        }
++        monotonic_t freeze_at = monotonic();
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            TUIScrollContext *c = &self->tui_frozen_scroll[i];
++            screen_tui_pane_scroll_sample(&self->tui_pane_scroll[i], freeze_at, &c->offset, &c->velocity);
++            c->started_at = freeze_at;
++        }
++        memcpy(self->tui_layers.frozen_windows, self->tui_scene.windows, sizeof(self->tui_layers.frozen_windows));
++        self->tui_layers.frozen_retained_rows = screen_tui_retained_rows(self);
++        self->tui_layers.frozen_scroll_offset = screen_tui_scroll_offset(self, monotonic());
++        self->tui_layers.frozen_scroll_rect[0] = self->tui_scroll.top;
++        self->tui_layers.frozen_scroll_rect[1] = self->tui_scroll.bottom;
++        self->tui_layers.frozen_scroll_rect[2] = self->tui_scroll.left;
++        self->tui_layers.frozen_scroll_rect[3] = self->tui_scroll.right;
++        self->tui_layers.frozen_owner_id = self->tui_scroll.owner_id;
++        if (self->tui_scene.cursor_moving) screen_tui_cursor_sample(self, monotonic(), &self->tui_layers.frozen_cursor_x, &self->tui_layers.frozen_cursor_y);
++        else { self->tui_layers.frozen_cursor_x = self->cursor_render_info.x; self->tui_layers.frozen_cursor_y = self->cursor_render_info.y; }
++    }
++    self->tui_update_started_at = monotonic();
++    self->paused_rendering.expires_at = self->tui_update_started_at + ms_to_monotonic_t(for_in_ms);
+     self->paused_rendering.inverted = self->modes.mDECSCNM;
+     self->paused_rendering.scrolled_by = self->scrolled_by;
+     self->paused_rendering.cell_data_updated = false;
+@@ -3933,6 +4013,606 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
+ }
+ 
+ 
++void
++screen_tui_scene_reset(Screen *s) {
++    screen_tui_layer_end(s);
++    Py_CLEAR(s->tui_layers.discard);
++    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
++        Py_CLEAR(s->tui_layers.layers[i].current);
++        Py_CLEAR(s->tui_layers.layers[i].pending);
++    }
++    memset(&s->tui_layers, 0, sizeof(s->tui_layers));
++    Py_CLEAR(s->tui_scene.snapshot);
++    memset(&s->tui_scene, 0, sizeof(s->tui_scene));
++    s->reload_all_gpu_data = s->is_dirty = true;
++}
++
++void
++screen_tui_scene_capture(Screen *s, unsigned top, unsigned bottom, unsigned left, unsigned right) {
++    if (!s->tui_scroll.enabled || s->linebuf != s->alt_linebuf || top >= bottom || bottom > s->lines || left >= right || right > s->columns) return;
++    // Coalesce multiple layout events in the same redraw, retaining the original scene.
++    monotonic_t now = monotonic();
++    if (s->tui_scene.snapshot && now - s->tui_scene.started_at < ms_to_monotonic_t(12)) return;
++    Py_CLEAR(s->tui_scene.snapshot);
++    s->tui_scene.snapshot = alloc_linebuf(s->lines, s->columns, s->text_cache);
++    if (!s->tui_scene.snapshot) { PyErr_Clear(); return; }
++    for (unsigned y = 0; y < s->lines; y++) {
++        linebuf_init_line(s->linebuf, y);
++        linebuf_copy_line_to(s->tui_scene.snapshot, s->linebuf->line, y);
++        CPUCell *cells = linebuf_cpu_cells_for_line(s->tui_scene.snapshot, y);
++        for (unsigned x = 0; x < s->columns; x++) cells[x].hyperlink_id = 0;
++    }
++    s->tui_scene.top = top; s->tui_scene.bottom = bottom;
++    s->tui_scene.left = left; s->tui_scene.right = right;
++    // Window motion has its own timeline and can survive a scene recapture.
++    s->tui_scene.started_at = now;
++    s->reload_all_gpu_data = s->is_dirty = true;
++}
++
++// Retain native Neovim grids independently of the flattened terminal image.
++void
++screen_tui_layer_end(Screen *s) {
++    if (!s->tui_layers.saved_linebuf) return;
++    s->linebuf = s->tui_layers.saved_linebuf;
++    *s->cursor = s->tui_layers.saved_cursor;
++    s->tui_layers.saved_linebuf = NULL;
++}
++
++void
++screen_tui_layers_begin(Screen *s) {
++    if (!s->tui_scroll.enabled || s->linebuf != s->alt_linebuf) return;
++    s->tui_layers.pending_focused_owner_id = s->tui_layers.focused_owner_id;
++    s->tui_layers.inventory = true;
++    s->tui_layers.overflow = false;
++    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) s->tui_layers.layers[i].seen = false;
++    s->tui_layers.layers[TUI_WINDOW_SLOTS].seen = true;
++}
++
++static unsigned
++tui_layer_slot(Screen *s, unsigned id) {
++    if (id == 1) return TUI_WINDOW_SLOTS;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++)
++        if (s->tui_scene.windows[i].open_id == id && s->tui_scene.windows[i].open_bottom) return i;
++    return TUI_WINDOW_SLOTS + 1;
++}
++
++void
++screen_tui_layer_geometry(Screen *s, unsigned id, unsigned top, unsigned bottom, unsigned left, unsigned right, unsigned priority) {
++    if (!s->tui_layers.inventory || id == 1 || top >= bottom || bottom > s->lines || left >= right || right > s->columns || priority > 1000000) return;
++    unsigned slot = tui_layer_slot(s, id);
++    if (slot > TUI_WINDOW_SLOTS) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (!s->tui_scene.windows[i].open_bottom) { slot = i; break; }
++        if (slot > TUI_WINDOW_SLOTS && !(s->paused_rendering.expires_at && s->tui_layers.frozen)) {
++            // Retiring surfaces yield to live windows at bounded capacity.
++            // Never change frozen GPU packing midway through a sync update.
++            for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (s->tui_scene.windows[i].closing) { slot = i; break; }
++        }
++        if (slot > TUI_WINDOW_SLOTS) { s->tui_layers.overflow = true; return; }
++        Py_CLEAR(s->tui_layers.layers[slot].current);
++        Py_CLEAR(s->tui_layers.layers[slot].pending);
++        memset(&s->tui_scene.windows[slot], 0, sizeof(TUIWindowMotion));
++    }
++    TUIWindowMotion *w = &s->tui_scene.windows[slot];
++    bool existing = w->open_bottom != 0;
++    if (existing && (w->open_top != top || w->open_bottom != bottom ||
++                     w->open_left != left || w->open_right != right)) {
++        // Retained scroll rows use the old pane's screen coordinates and width.
++        // They cannot be sampled after a split changes that coordinate system.
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++)
++            if (s->tui_pane_scroll[i].owner_id == id) screen_tui_pane_scroll_clear(&s->tui_pane_scroll[i]);
++    }
++    if (existing && s->tui_scene.cursor_initialized && s->tui_scene.cursor_owner_id == id) {
++        // Cursor springs live in destination screen coordinates. Translate both
++        // endpoints with their pane before applying its visual motion offset.
++        // Otherwise the logical layout shift is animated twice in opposite
++        // directions, making a stationary buffer cursor drift and snap back.
++        float shift_x = (float)left - w->open_left;
++        float shift_y = (float)top - w->open_top;
++        s->tui_scene.x += shift_x; s->tui_scene.target_x += shift_x;
++        s->tui_scene.y += shift_y; s->tui_scene.target_y += shift_y;
++    }
++    float dx = existing ? (float)w->open_left - left : 0.f;
++    float dy = existing ? (float)w->open_top - top : 0.f;
++    if (!existing) {
++        // Infer attachment from geometry, never plugin identity. Bound the
++        // entrance distance so large panels do not travel across the editor.
++        float horizontal = MIN(2.f, (right - left) * .12f);
++        float vertical = MIN(.75f, (bottom - top) * .12f);
++        bool narrow = right - left <= s->columns / 2;
++        bool short_panel = bottom - top <= s->lines / 2;
++        if (!priority && narrow && left == 0) dx = -horizontal;
++        else if (!priority && narrow && right == s->columns) dx = horizontal;
++        else if (!priority && short_panel && top <= 1) dy = -vertical;
++        else if (!priority && short_panel && bottom + 2 >= s->lines) dy = vertical;
++        else if (priority) dy = .25f;
++        // Interior splits and full-screen replacement need no guessed edge.
++    }
++    if (!existing || w->closing || dx != 0.f || dy != 0.f || w->open_right != right || w->open_bottom != bottom) {
++        s->tui_scene.cursor_layout_changed = true;
++        screen_tui_window_update(s, top, bottom, left, right, dx, dy, id, priority);
++    } else w->priority = priority;
++    // Native grids are already laid out at their final dimensions. Expanding
++    // their old crop from a corner stretches backgrounds and reveals stale
++    // layout; animate translation only and keep glyphs at their native size.
++    w->size_x = w->size_y = w->size_vx = w->size_vy = 0;
++    w->quick_motion = true;
++    s->tui_layers.layers[slot].seen = true;
++}
++
++void
++screen_tui_layer_select(Screen *s, unsigned id, unsigned top, unsigned left, unsigned width, unsigned height, unsigned priority) {
++    screen_tui_layer_end(s);
++    if (!s->tui_layers.inventory || !width || !height || top >= s->lines || left >= s->columns || height > s->lines - top || width > s->columns - left) return;
++    if (id != 1 && tui_layer_slot(s, id) > TUI_WINDOW_SLOTS)
++        screen_tui_layer_geometry(s, id, top, top + height, left, left + width, priority);
++    unsigned slot = tui_layer_slot(s, id);
++    if (slot > TUI_WINDOW_SLOTS) {
++        // Overflow must never redirect offscreen ANSI into the real terminal.
++        if (!s->tui_layers.discard) s->tui_layers.discard = alloc_linebuf(s->lines, s->columns, s->text_cache);
++        if (!s->tui_layers.discard) { PyErr_Clear(); return; }
++        linebuf_clear(s->tui_layers.discard, BLANK_CHAR);
++        s->tui_layers.saved_linebuf = s->linebuf;
++        s->tui_layers.saved_cursor = *s->cursor;
++        s->linebuf = s->tui_layers.discard;
++        return;
++    }
++    TUIRetainedLayer *layer = &s->tui_layers.layers[slot];
++    Py_CLEAR(layer->pending);
++    layer->pending = alloc_linebuf(s->lines, s->columns, s->text_cache);
++    if (!layer->pending) { PyErr_Clear(); return; }
++    layer->seen = true;
++    s->tui_layers.saved_linebuf = s->linebuf;
++    s->tui_layers.saved_cursor = *s->cursor;
++    s->linebuf = layer->pending;
++    s->cursor->x = s->cursor->y = 0;
++}
++
++void
++screen_tui_layers_commit(Screen *s) {
++    screen_tui_layer_end(s);
++    if (!s->tui_layers.inventory) return;
++    if (s->paused_rendering.expires_at) { s->tui_layers.pending_commit = true; return; }
++    bool content_changed = false;
++    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
++        TUIRetainedLayer *layer = &s->tui_layers.layers[i];
++        if (!layer->seen) {
++            content_changed = content_changed || layer->current != NULL;
++            Py_CLEAR(layer->pending);
++            // Dismiss departed surfaces at the committed redraw. The surviving
++            // panes animate their new geometry; shrinking old text to a corner
++            // obscures the new layout and makes transient UI linger.
++            Py_CLEAR(layer->current);
++            if (i < TUI_WINDOW_SLOTS) {
++                if (s->tui_scene.windows[i].open_bottom) s->tui_scene.cursor_layout_changed = true;
++                memset(&s->tui_scene.windows[i], 0, sizeof(TUIWindowMotion));
++            }
++        } else if (layer->pending) {
++            content_changed = true;
++            Py_CLEAR(layer->current);
++            layer->current = layer->pending;
++            layer->pending = NULL;
++        }
++    }
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        if (s->tui_layers.layers[i].seen && !s->tui_scene.windows[i].priority && !s->tui_scene.windows[i].closing) Py_CLEAR(s->tui_layers.layers[i].current);
++        TUIScrollContext *c = &s->tui_pane_scroll[i];
++        unsigned slot = tui_layer_slot(s, c->owner_id);
++        if (c->owner_id && (s->tui_layers.overflow || slot >= TUI_WINDOW_SLOTS || !s->tui_layers.layers[slot].seen ||
++            (c->buffer_id && s->tui_scene.windows[slot].buffer_id && c->buffer_id != s->tui_scene.windows[slot].buffer_id))) {
++            screen_tui_pane_scroll_clear(c);
++        } else {
++            if (slot < TUI_WINDOW_SLOTS) c->buffer_id = s->tui_scene.windows[slot].buffer_id;
++            Py_CLEAR(c->frame_source);
++            c->frame_delta = 0;
++        }
++    }
++    if (s->tui_scroll.owner_id) {
++        unsigned owner = tui_layer_slot(s, s->tui_scroll.owner_id);
++        if (s->tui_layers.overflow || owner >= TUI_WINDOW_SLOTS || !s->tui_layers.layers[owner].current) {
++            screen_tui_scroll_reset(s);
++            s->tui_scroll.enabled = true;
++        }
++    }
++    // A newly admitted floating grid needs its own surface before native
++    // composition can resume. Full-capacity ID churn can reject exports in
++    // one frame even when the following inventory itself fits the limit.
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        if (s->tui_layers.layers[i].seen && s->tui_scene.windows[i].priority && !s->tui_layers.layers[i].current)
++            s->tui_layers.overflow = true;
++    }
++    s->tui_layers.active = !s->tui_layers.overflow && s->tui_layers.layers[TUI_WINDOW_SLOTS].current != NULL;
++
++    s->tui_layers.focused_owner_id = s->tui_layers.pending_focused_owner_id;
++    s->tui_layers.inventory = s->tui_layers.pending_commit = false;
++    content_changed = content_changed || s->tui_scene.snapshot != NULL;
++    Py_CLEAR(s->tui_scene.snapshot);
++    s->reload_all_gpu_data = s->reload_all_gpu_data || content_changed;
++    s->is_dirty = true;
++}
++
++bool
++screen_tui_windows_active(const Screen *s) {
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (s->tui_scene.windows[i].open_at) return true;
++    return false;
++}
++
++void
++screen_tui_window_sample_slot(const Screen *s, unsigned slot, monotonic_t now, float *x, float *y, float *vx, float *vy) {
++    *x = *y = *vx = *vy = 0;
++    if (slot >= TUI_WINDOW_SLOTS) return;
++    const TUIWindowMotion *w = screen_tui_render_window(s, slot);
++    if (s->paused_rendering.expires_at && s->tui_layers.frozen) now = s->tui_update_started_at;
++    if (!w->open_at) return;
++    float t = MAX(0.f, (float)monotonic_t_to_s_double(now - w->open_at));
++    if (w->quick_motion) {
++        tui_surface_sample(w->open_x, w->open_vx, t, .06f, s->tui_bounce_strength, s->tui_bounce_duration, x, vx);
++        tui_surface_sample(w->open_y, w->open_vy, t, .06f, s->tui_bounce_strength, s->tui_bounce_duration, y, vy);
++        return;
++    }
++    float decay = expf(-28.f * t);
++    float cx = w->open_vx + 28.f * w->open_x, cy = w->open_vy + 28.f * w->open_y;
++    *x = (w->open_x + cx * t) * decay; *y = (w->open_y + cy * t) * decay;
++    *vx = (w->open_vx - 28.f * cx * t) * decay; *vy = (w->open_vy - 28.f * cy * t) * decay;
++}
++
++void
++screen_tui_window_size_sample(const Screen *s, unsigned slot, monotonic_t now, float *width, float *height, float *vx, float *vy) {
++    *width = *height = *vx = *vy = 0;
++    if (slot >= TUI_WINDOW_SLOTS) return;
++    const TUIWindowMotion *w = screen_tui_render_window(s, slot);
++    float target_w = w->closing ? 0.f : w->open_right - w->open_left;
++    float target_h = w->closing ? 0.f : w->open_bottom - w->open_top;
++    if (!w->open_at) { *width = target_w; *height = target_h; return; }
++    if (s->paused_rendering.expires_at && s->tui_layers.frozen) now = s->tui_update_started_at;
++    float t = MAX(0.f, (float)monotonic_t_to_s_double(now - w->open_at));
++    float decay = expf(-28.f * t);
++    float cx = w->size_vx + 28.f * w->size_x, cy = w->size_vy + 28.f * w->size_y;
++    *width = MAX(0.f, target_w + (w->size_x + cx * t) * decay);
++    *height = MAX(0.f, target_h + (w->size_y + cy * t) * decay);
++    *vx = (w->size_vx - 28.f * cx * t) * decay;
++    *vy = (w->size_vy - 28.f * cy * t) * decay;
++}
++
++void
++screen_tui_window_sample(const Screen *s, monotonic_t now, float *x, float *y, float *vx, float *vy) {
++    screen_tui_window_sample_slot(s, s->tui_scene.last_window_slot, now, x, y, vx, vy);
++}
++
++void
++screen_tui_window_update(Screen *s, unsigned top, unsigned bottom, unsigned left, unsigned right, float dx, float dy, unsigned id, unsigned priority) {
++    if (!s->tui_scroll.enabled || s->linebuf != s->alt_linebuf) return;
++    if (!top && !bottom && !left && !right) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            TUIWindowMotion *w = &s->tui_scene.windows[i];
++            if (!id || id == w->open_id) memset(w, 0, sizeof(*w));
++        }
++        s->is_dirty = true;
++        return;
++    }
++    if (top >= bottom || bottom > s->lines || left >= right || right > s->columns ||
++        !isfinite(dx) || !isfinite(dy) || fabsf(dx) > 2 * s->columns || fabsf(dy) > 2 * s->lines || priority > 1000000) return;
++    unsigned slot = TUI_WINDOW_SLOTS;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (s->tui_scene.windows[i].open_id == id && s->tui_scene.windows[i].open_bottom) { slot = i; break; }
++    if (slot == TUI_WINDOW_SLOTS) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (!s->tui_scene.windows[i].open_bottom) { slot = i; break; }
++    }
++    if (slot == TUI_WINDOW_SLOTS) {
++        // Bound memory and uniform cost. Reuse the oldest slot on overflow.
++        slot = 0;
++        for (unsigned i = 1; i < TUI_WINDOW_SLOTS; i++) if (s->tui_scene.windows[i].open_at < s->tui_scene.windows[slot].open_at) slot = i;
++    }
++    TUIWindowMotion *w = &s->tui_scene.windows[slot];
++    monotonic_t now = monotonic();
++    float x = 0, y = 0, vx = 0, vy = 0;
++    float width = right - left, height = bottom - top, size_vx = 0, size_vy = 0;
++    if (id == w->open_id) {
++        screen_tui_window_sample_slot(s, slot, now, &x, &y, &vx, &vy);
++        screen_tui_window_size_sample(s, slot, now, &width, &height, &size_vx, &size_vy);
++    }
++    *w = (TUIWindowMotion){.open_top = top, .open_bottom = bottom, .open_left = left, .open_right = right,
++        .open_id = id, .priority = priority, .buffer_id = w->buffer_id, .size_x = width - (right - left), .size_y = height - (bottom - top),
++        .size_vx = size_vx, .size_vy = size_vy, .open_x = x + dx, .open_y = y + dy, .open_vx = vx, .open_vy = vy, .open_at = now};
++    s->tui_scene.last_window_slot = slot;
++    s->is_dirty = true;
++}
++
++static void
++tui_cursor_axis_sample(float start, float target, float velocity, float t, float *position, float *speed) {
++    // Smooth cursor travel without a settling bounce.
++    const float omega = 32.f;
++    float delta = start - target, decay = expf(-omega * t);
++    // Reversals and shortened jumps must not carry momentum past the target.
++    if (delta * velocity >= 0.f) velocity = 0.f;
++    else velocity = copysignf(MIN(fabsf(velocity), omega * fabsf(delta)), velocity);
++    float b = velocity + omega * delta;
++    float offset = (delta + b * t) * decay;
++    *speed = (velocity - omega * b * t) * decay;
++    *position = target + offset;
++}
++
++void
++screen_tui_cursor_sample(Screen *s, monotonic_t now, float *x, float *y) {
++    float t = MAX(0.f, (float)monotonic_t_to_s_double(now - s->tui_scene.cursor_at));
++    float vx, vy;
++    tui_cursor_axis_sample(s->tui_scene.x, s->tui_scene.target_x, s->tui_scene.vx, t, x, &vx);
++    tui_cursor_axis_sample(s->tui_scene.y, s->tui_scene.target_y, s->tui_scene.vy, t, y, &vy);
++}
++
++bool
++screen_tui_scene_tick(Screen *s, monotonic_t now) {
++    if (!s->tui_scroll.enabled || s->linebuf != s->alt_linebuf) return false;
++    bool was_moving = s->tui_scene.cursor_moving;
++    bool active = s->tui_scene.snapshot != NULL;
++    if (active && !screen_tui_windows_active(s) && now - s->tui_scene.started_at >= ms_to_monotonic_t(180)) {
++        Py_CLEAR(s->tui_scene.snapshot);
++        s->reload_all_gpu_data = s->is_dirty = true;
++    }
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        TUIWindowMotion *w = &s->tui_scene.windows[i];
++        if (!w->open_at) continue;
++        active = true;
++        float x, y, vx, vy;
++        screen_tui_window_sample_slot(s, i, now, &x, &y, &vx, &vy);
++        float width, height, svx, svy;
++        screen_tui_window_size_sample(s, i, now, &width, &height, &svx, &svy);
++        float tw = w->closing ? 0.f : w->open_right - w->open_left;
++        float th = w->closing ? 0.f : w->open_bottom - w->open_top;
++        if (fabsf(x) + fabsf(y) + fabsf(width - tw) + fabsf(height - th) < .001f && fabsf(vx) + fabsf(vy) + fabsf(svx) + fabsf(svy) < .02f) {
++            w->open_at = 0;
++            if (w->closing) {
++                Py_CLEAR(s->tui_layers.layers[i].current);
++                Py_CLEAR(s->tui_layers.layers[i].pending);
++                memset(w, 0, sizeof(*w));
++                s->reload_all_gpu_data = s->is_dirty = true;
++            }
++        }
++    }
++    CursorRenderInfo *c = &s->cursor_render_info;
++    unsigned cursor_owner = s->tui_layers.focused_owner_id;
++    bool focus_changed = cursor_owner != s->tui_scene.cursor_owner_id || s->tui_scene.cursor_layout_changed;
++    s->tui_scene.cursor_layout_changed = false;
++    s->tui_scene.cursor_owner_id = cursor_owner;
++    // Focus transfer starts in the destination pane. Its own geometry animation
++    // carries the cursor; a second spring from the previous pane crosses text
++    // and applies the destination transform to the wrong starting position.
++    if (!s->tui_scene.cursor_initialized || focus_changed || !c->is_visible || !c->is_focused) {
++        s->tui_scene.x = s->tui_scene.target_x = c->x;
++        s->tui_scene.y = s->tui_scene.target_y = c->y;
++        s->tui_scene.vx = s->tui_scene.vy = 0;
++        s->tui_scene.cursor_at = now;
++        s->tui_scene.cursor_initialized = true;
++        s->tui_scene.cursor_moving = false;
++    } else {
++        float x, y;
++        screen_tui_cursor_sample(s, now, &x, &y);
++        if (s->tui_scene.target_x != c->x || s->tui_scene.target_y != c->y) {
++            float t = MAX(0.f, (float)monotonic_t_to_s_double(now - s->tui_scene.cursor_at));
++            tui_cursor_axis_sample(s->tui_scene.x, s->tui_scene.target_x, s->tui_scene.vx, t, &x, &s->tui_scene.vx);
++            tui_cursor_axis_sample(s->tui_scene.y, s->tui_scene.target_y, s->tui_scene.vy, t, &y, &s->tui_scene.vy);
++            s->tui_scene.x = x; s->tui_scene.y = y;
++            s->tui_scene.target_x = c->x; s->tui_scene.target_y = c->y;
++            s->tui_scene.cursor_at = now;
++        }
++        float speed_x, speed_y;
++        float elapsed = MAX(0.f, (float)monotonic_t_to_s_double(now - s->tui_scene.cursor_at));
++        tui_cursor_axis_sample(s->tui_scene.x, s->tui_scene.target_x, s->tui_scene.vx, elapsed, &x, &speed_x);
++        tui_cursor_axis_sample(s->tui_scene.y, s->tui_scene.target_y, s->tui_scene.vy, elapsed, &y, &speed_y);
++        // Crossing the target is not settling: keep scheduling the small return.
++        s->tui_scene.cursor_moving = fabsf(x - c->x) + fabsf(y - c->y) > .015f || fabsf(speed_x) + fabsf(speed_y) > .1f;
++        active |= s->tui_scene.cursor_moving;
++    }
++    return active || was_moving;
++}
++
++void
++screen_tui_pane_scroll_clear(TUIScrollContext *c) {
++    Py_CLEAR(c->retained); Py_CLEAR(c->scratch); Py_CLEAR(c->frame_source);
++    memset(c, 0, sizeof(*c));
++}
++
++static unsigned
++tui_cursor_owner(const Screen *s, float x, float y) {
++    if (s->tui_layers.focused_owner_id) return s->tui_layers.focused_owner_id;
++    unsigned owner = 0, priority = 0;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        const TUIWindowMotion *w = &s->tui_scene.windows[i];
++        unsigned p = w->priority * TUI_WINDOW_SLOTS + i;
++        if (!w->closing && w->open_bottom && x >= w->open_left && x < w->open_right && y >= w->open_top && y < w->open_bottom && (!owner || p >= priority)) {
++            owner = w->open_id; priority = p;
++        }
++    }
++    return owner;
++}
++
++void
++screen_tui_pane_scroll_update(Screen *s, unsigned owner, unsigned top, unsigned bottom, unsigned left, unsigned right, int delta) {
++    if (!s->tui_scroll.enabled || s->linebuf != s->alt_linebuf || !owner || !delta || top >= bottom || bottom > s->lines || left >= right || right > s->columns) return;
++    TUIScrollContext *c = NULL;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (s->tui_pane_scroll[i].owner_id == owner) c = &s->tui_pane_scroll[i];
++    if (!c) for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (!s->tui_pane_scroll[i].owner_id) { c = &s->tui_pane_scroll[i]; break; }
++    if (!c) return;
++    bool same = c->owner_id == owner && c->top == top && c->bottom == bottom && c->left == left && c->right == right;
++    if (!same) screen_tui_pane_scroll_clear(c);
++    c->bounce_strength = s->tui_bounce_strength; c->bounce_duration = s->tui_bounce_duration;
++    c->owner_id = owner; c->top = top; c->bottom = bottom; c->left = left; c->right = right;
++    monotonic_t now = monotonic();
++    float position, velocity;
++    screen_tui_pane_scroll_sample(c, now, &position, &velocity);
++    LineBuf *source = s->tui_layers.layers[TUI_WINDOW_SLOTS].current;
++    unsigned slot = tui_layer_slot(s, owner);
++    if (slot < TUI_WINDOW_SLOTS) c->buffer_id = s->tui_scene.windows[slot].buffer_id;
++    if (slot < TUI_WINDOW_SLOTS && s->tui_layers.layers[slot].current) source = s->tui_layers.layers[slot].current;
++    if (!source) source = s->linebuf;
++    if (!c->retained) {
++        c->retained = alloc_linebuf(2 * s->lines, s->columns, s->text_cache);
++        c->scratch = alloc_linebuf(2 * s->lines, s->columns, s->text_cache);
++        s->reload_all_gpu_data = true;
++    }
++    if (!c->retained || !c->scratch) { PyErr_Clear(); screen_tui_pane_scroll_clear(c); return; }
++    // Source grids are exported once per committed redraw. Multiple native
++    // scroll operations in that redraw therefore share one immutable source.
++    // Keep its surrounding retained rows and accumulate the logical displacement,
++    // instead of repeatedly copying stale viewport rows into the departing cache.
++    if (!c->frame_source) {
++        c->frame_source = alloc_linebuf(3 * s->lines, s->columns, s->text_cache);
++        if (!c->frame_source) { PyErr_Clear(); screen_tui_pane_scroll_clear(c); return; }
++        for (unsigned y = 0; y < 3 * s->lines; y++) {
++            int row = (int)y + (int)top - (int)s->lines;
++            LineBuf *lb = source; unsigned src;
++            if (row < (int)top) { lb = c->retained; src = y; }
++            else if (row >= (int)bottom) { lb = c->retained; src = (unsigned)(row - (int)bottom) + s->lines; }
++            else src = (unsigned)row;
++            if (src < lb->ynum) { linebuf_init_line(lb, src); linebuf_copy_line_to(c->frame_source, lb->line, y); }
++        }
++    }
++    c->frame_delta = MAX(-(int)s->lines, MIN((int)s->lines, c->frame_delta + delta));
++    linebuf_clear(c->scratch, BLANK_CHAR);
++    for (unsigned y = 0; y < 2 * s->lines; y++) {
++        int row = y < s->lines ? (int)top - (int)s->lines + (int)y : (int)bottom + (int)y - (int)s->lines;
++        int src = row + c->frame_delta - (int)top + (int)s->lines;
++        if (src >= 0 && src < (int)c->frame_source->ynum) {
++            linebuf_init_line(c->frame_source, (unsigned)src);
++            linebuf_copy_line_to(c->scratch, c->frame_source->line, y);
++            CPUCell *cells = linebuf_cpu_cells_for_line(c->scratch, y);
++            for (unsigned x = 0; x < s->columns; x++) cells[x].hyperlink_id = 0;
++        }
++    }
++    LineBuf *tmp = c->retained; c->retained = c->scratch; c->scratch = tmp;
++    float limit = (float)(bottom - top);
++    c->offset = MAX(-limit, MIN(limit, position + delta));
++    bool touchpad = c->last_input_at && now - c->last_input_at < ms_to_monotonic_t(220);
++    c->velocity = touchpad || fabsf(position + delta) > limit ? 0.f : velocity;
++    if (!touchpad) c->started_at = now;
++    if (s->tui_scene.cursor_initialized && tui_cursor_owner(s, s->tui_scene.target_x, s->tui_scene.target_y) == owner) {
++        float x, y;
++        screen_tui_cursor_sample(s, now, &x, &y);
++        float shift = c->offset - position;
++        s->tui_scene.x = x; s->tui_scene.y = y - shift;
++        s->tui_scene.target_y -= shift;
++        s->tui_scene.cursor_at = now;
++    }
++    s->is_dirty = true;
++}
++
++bool
++screen_tui_pane_scroll_tick(Screen *s, monotonic_t now) {
++    bool active = false;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        TUIScrollContext *c = &s->tui_pane_scroll[i];
++        if (!c->started_at) continue;
++        float position, velocity;
++        screen_tui_pane_scroll_sample(c, now, &position, &velocity);
++        active = true;
++        if (fabsf(position) < .001f && fabsf(velocity) < .02f) {
++            c->started_at = 0; c->offset = c->velocity = 0.f;
++            // Keep bounded rows to support immediate reversal without a gap.
++        }
++    }
++    return active;
++}
++
++void
++screen_tui_scroll_reset(Screen *self) {
++    Py_CLEAR(self->tui_scroll.retained);
++    Py_CLEAR(self->tui_scroll.scratch);
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) { screen_tui_pane_scroll_clear(&self->tui_pane_scroll[i]); screen_tui_pane_scroll_clear(&self->tui_frozen_scroll[i]); }
++    memset(&self->tui_scroll, 0, sizeof(self->tui_scroll));
++    self->reload_all_gpu_data = self->is_dirty = true;
++}
++
++void
++screen_tui_scroll_update(Screen *self, unsigned top, unsigned bottom, unsigned left, unsigned right, int delta) {
++    if (!self->tui_scroll.enabled || self->linebuf != self->alt_linebuf || top >= bottom || bottom > self->lines || left >= right || right > self->columns || !delta) return;
++    unsigned owner_id = 0, owner_priority = 0;
++    LineBuf *owner_source = self->linebuf;
++    if (self->tui_layers.active) {
++        owner_source = self->tui_layers.layers[TUI_WINDOW_SLOTS].current;
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIWindowMotion *w = &self->tui_scene.windows[i];
++            if (self->tui_layers.layers[i].current && w->priority >= owner_priority && top >= w->open_top && bottom <= w->open_bottom && left >= w->open_left && right <= w->open_right) {
++                owner_id = w->open_id;
++                owner_priority = w->priority;
++                owner_source = self->tui_layers.layers[i].current;
++            }
++        }
++    }
++    monotonic_t now = monotonic();
++    float position = 0.f, velocity = 0.f;
++    bool same_region = self->tui_scroll.owner_id == owner_id && self->tui_scroll.top == top && self->tui_scroll.bottom == bottom && self->tui_scroll.left == left && self->tui_scroll.right == right;
++    bool touchpad = self->tui_scroll.last_input_at && now - self->tui_scroll.last_input_at < ms_to_monotonic_t(220);
++    if (same_region || !self->tui_scroll.bottom) screen_tui_scroll_sample(self, now, &position, &velocity);
++    if (!same_region && self->tui_scroll.retained) {
++        Py_CLEAR(self->tui_scroll.retained);
++        Py_CLEAR(self->tui_scroll.scratch);
++    }
++    if (!self->tui_scroll.retained) {
++        self->tui_scroll.retained = alloc_linebuf(2 * self->lines, self->columns, self->text_cache);
++        self->tui_scroll.scratch = alloc_linebuf(2 * self->lines, self->columns, self->text_cache);
++        if (!self->tui_scroll.retained || !self->tui_scroll.scratch) {
++            PyErr_Clear();
++            screen_tui_scroll_reset(self);
++            return;
++        }
++        self->reload_all_gpu_data = true;
++    }
++    LineBuf *old = self->tui_scroll.retained, *dest = self->tui_scroll.scratch;
++    linebuf_clear(dest, BLANK_CHAR);
++    // Distant jumps transition through the old and new screens without inventing
++    // unseen buffer text, like GUI frontends with bounded retained content.
++    int retained_delta = MAX(-(int)(bottom - top), MIN((int)(bottom - top), delta));
++    // Cache one screen above and below the new viewport. Copy departing rows
++    // before the following terminal scroll/redraw mutates the live grid.
++    for (unsigned i = 0; i < 2 * self->lines; i++) {
++        int row = i < self->lines ? (int)top - (int)self->lines + (int)i : (int)bottom + (int)i - (int)self->lines;
++        int src = row + retained_delta;
++        Line *line = NULL;
++        if (src >= (int)top && src < (int)bottom) {
++            linebuf_init_line(owner_source, (index_type)src);
++            line = owner_source->line;
++        } else if (src >= (int)top - (int)self->lines && src < (int)top) {
++            linebuf_init_line(old, (index_type)(src - (int)top + (int)self->lines));
++            line = old->line;
++        } else if (src >= (int)bottom && src < (int)bottom + (int)self->lines) {
++            linebuf_init_line(old, (index_type)(src - (int)bottom + (int)self->lines));
++            line = old->line;
++        }
++        if (line) {
++            linebuf_copy_line_to(dest, line, i);
++            CPUCell *cells = linebuf_cpu_cells_for_line(dest, i);
++            for (unsigned x = 0; x < self->columns; x++) cells[x].hyperlink_id = 0;
++        }
++    }
++    self->tui_scroll.retained = dest;
++    self->tui_scroll.scratch = old;
++    self->tui_scroll.owner_id = owner_id;
++    self->tui_scroll.top = top;
++    self->tui_scroll.bottom = bottom;
++    self->tui_scroll.left = left;
++    self->tui_scroll.right = right;
++    float limit = (float)(bottom - top);
++    self->tui_scroll.offset = MAX(-limit, MIN(limit, position + delta));
++    // Keep the moving cursor in the same visual place when the logical grid
++    // scrolls underneath it. The cell shader adds the new viewport offset back.
++    if (self->tui_scene.cursor_initialized && self->tui_scene.target_x >= left && self->tui_scene.target_x < right &&
++        self->tui_scene.target_y >= top && self->tui_scene.target_y < bottom) {
++        float x, y;
++        screen_tui_cursor_sample(self, now, &x, &y);
++        float t = MAX(0.f, (float)monotonic_t_to_s_double(now - self->tui_scene.cursor_at));
++        float decay = expf(-32.f * t);
++        float dx = self->tui_scene.x - self->tui_scene.target_x, dy = self->tui_scene.y - self->tui_scene.target_y;
++        self->tui_scene.vx = (self->tui_scene.vx - 32.f * (self->tui_scene.vx + 32.f * dx) * t) * decay;
++        self->tui_scene.vy = (self->tui_scene.vy - 32.f * (self->tui_scene.vy + 32.f * dy) * t) * decay;
++        float shift = self->tui_scroll.offset - position;
++        self->tui_scene.x = x; self->tui_scene.y = y - shift;
++        self->tui_scene.target_y -= shift;
++        self->tui_scene.cursor_at = now;
++    }
++    self->tui_scroll.velocity = touchpad ? 0.f : velocity;
++    if (fabsf(position + delta) > limit) self->tui_scroll.velocity = 0.f;
++    if (!touchpad) self->tui_scroll.started_at = now;
++    self->is_dirty = true;
++}
++
+ static void
+ update_line_data(Line *line, unsigned int dest_y, uint8_t *data) {
+     size_t base = sizeof(GPUCell) * dest_y * line->xnum;
+@@ -4128,7 +4808,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+     const bool force_history_render = pixel_scroll_enabled(self) && self->scroll_changed;
+     if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_added_count, self->historybuf->count);
+     self->scroll_changed = false;
+-    const unsigned int render_lines = render_lines_for_screen(self);
++    const unsigned int render_lines = self->lines + pixel_scroll_enabled(self);
+     const int render_row_offset = pixel_scroll_enabled(self);
+     Line line = {.text_cache = self->text_cache};
+     for (unsigned int render_row = 0; render_row < render_lines; render_row++) {
+@@ -4160,6 +4840,64 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+         }
+         update_line_data(linep, render_row, address);
+     }
++    if (screen_tui_scene_rows(self)) {
++        LineBuf *lb = self->tui_scene.snapshot;
++        unsigned base = self->lines + screen_tui_retained_rows(self);
++        for (unsigned y = 0; y < self->lines; y++) {
++            linebuf_init_line(lb, y);
++            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
++                linebuf_mark_line_clean(lb, y);
++            }
++            update_line_data(lb->line, base + y, address);
++        }
++    }
++    unsigned retained_rows = screen_tui_retained_rows(self);
++    if (retained_rows) {
++        LineBuf *lb = self->tui_scroll.retained;
++        for (unsigned y = 0; y < retained_rows; y++) {
++            linebuf_init_line(lb, y);
++            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
++                linebuf_mark_line_clean(lb, y);
++            }
++            update_line_data(lb->line, self->lines + y, address);
++        }
++    }
++    if (screen_tui_layer_rows(self)) {
++        unsigned base = self->lines + screen_tui_retained_rows(self) + screen_tui_scene_rows(self);
++        unsigned packed = 0;
++        for (unsigned index = 0; index <= TUI_WINDOW_SLOTS; index++) {
++            unsigned i = index == 0 ? TUI_WINDOW_SLOTS : index - 1;
++            LineBuf *lb = self->tui_layers.layers[i].current;
++            if (!lb) continue;
++            for (unsigned y = 0; y < self->lines; y++) {
++                unsigned row = base + packed * self->lines + y;
++                if (lb->xnum != self->columns || lb->ynum != self->lines) { update_line_data_blank(self->columns, row, address); continue; }
++                linebuf_init_line(lb, y);
++                if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                    render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
++                    linebuf_mark_line_clean(lb, y);
++                }
++                update_line_data(lb->line, row, address);
++            }
++            packed++;
++        }
++    }
++    unsigned pane_base = self->lines + screen_tui_retained_rows(self) + screen_tui_scene_rows(self) + screen_tui_layer_rows(self);
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        LineBuf *lb = self->tui_pane_scroll[i].retained;
++        if (!lb || lb->xnum != self->columns || lb->ynum != 2 * self->lines) continue;
++        for (unsigned y = 0; y < 2 * self->lines; y++) {
++            linebuf_init_line(lb, y);
++            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
++                linebuf_mark_line_clean(lb, y);
++            }
++            update_line_data(lb->line, pane_base + y, address);
++        }
++        pane_base += 2 * self->lines;
++    }
+     if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
+         if (self->overlay_line.is_dirty) {
+             linebuf_init_line(self->linebuf, self->overlay_line.ynum);
+@@ -7187,7 +7925,78 @@ test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
+     return Py_BuildValue("kkk", is_idx, idx, ca);
+ }
+ 
++static PyObject *test_tui_layer(Screen *self, PyObject *args) {
++    int signed_id;
++    if (!PyArg_ParseTuple(args, "i", &signed_id)) return NULL;
++    unsigned slot = tui_layer_slot(self, (unsigned)signed_id);
++    if (slot > TUI_WINDOW_SLOTS) Py_RETURN_NONE;
++    LineBuf *lb = self->tui_layers.layers[slot].current;
++    if (!lb) lb = self->tui_layers.layers[TUI_WINDOW_SLOTS].current;
++    if (!lb) Py_RETURN_NONE;
++    if (slot == TUI_WINDOW_SLOTS) return Py_BuildValue("(OIIIII)", lb, 0u, self->lines, 0u, self->columns, 0u);
++    TUIWindowMotion *w = &self->tui_scene.windows[slot];
++    return Py_BuildValue("(OIIIII)", lb, w->open_top, w->open_bottom, w->open_left, w->open_right, w->priority);
++}
++
++static PyObject *test_tui_window_sample(Screen *self, PyObject *args) {
++    double seconds;
++    unsigned id = 0, slot = self->tui_scene.last_window_slot;
++    if (!PyArg_ParseTuple(args, "d|I", &seconds, &id)) return NULL;
++    if (id) {
++        slot = TUI_WINDOW_SLOTS;
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (self->tui_scene.windows[i].open_id == id) { slot = i; break; }
++    }
++    if (slot == TUI_WINDOW_SLOTS) return Py_BuildValue("(ffffI)", 0., 0., 0., 0., 0);
++    float x, y, vx, vy;
++    TUIWindowMotion *w = &self->tui_scene.windows[slot];
++    screen_tui_window_sample_slot(self, slot, w->open_at + s_double_to_monotonic_t(seconds), &x, &y, &vx, &vy);
++    return Py_BuildValue("(ffffI)", x, y, vx, vy, w->open_id);
++}
++
++static PyObject *test_tui_window_size(Screen *self, PyObject *args) {
++    double seconds; unsigned id;
++    if (!PyArg_ParseTuple(args, "dI", &seconds, &id)) return NULL;
++    unsigned slot = tui_layer_slot(self, id);
++    if (slot >= TUI_WINDOW_SLOTS) Py_RETURN_NONE;
++    TUIWindowMotion *w = &self->tui_scene.windows[slot];
++    float width, height, vx, vy;
++    screen_tui_window_size_sample(self, slot, w->open_at + s_double_to_monotonic_t(seconds), &width, &height, &vx, &vy);
++    return Py_BuildValue("(ffffO)", width, height, vx, vy, w->closing ? Py_True : Py_False);
++}
++
++static PyObject *test_tui_cursor(Screen *self, PyObject *args) {
++    double seconds;
++    unsigned x, y;
++    if (!PyArg_ParseTuple(args, "dII", &seconds, &x, &y)) return NULL;
++    monotonic_t now = self->tui_scene.cursor_at + s_double_to_monotonic_t(seconds);
++    self->cursor_render_info.x = x; self->cursor_render_info.y = y;
++    self->cursor_render_info.is_visible = self->cursor_render_info.is_focused = true;
++    bool active = screen_tui_scene_tick(self, now);
++    float px, py;
++    screen_tui_cursor_sample(self, now, &px, &py);
++    return Py_BuildValue("(ffO)", px, py, active ? Py_True : Py_False);
++}
++static PyObject *
++test_tui_pane_scroll(Screen *self, PyObject *args) {
++    unsigned owner; double seconds = -1;
++    if (!PyArg_ParseTuple(args, "I|d", &owner, &seconds)) return NULL;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        const TUIScrollContext *c = &self->tui_pane_scroll[i];
++        if (c->owner_id != owner) continue;
++        float position, velocity;
++        screen_tui_pane_scroll_sample(c, seconds < 0 ? monotonic() : c->started_at + s_double_to_monotonic_t(seconds), &position, &velocity);
++        return Py_BuildValue("(ffIIIIOi)", position, velocity, c->top, c->bottom, c->left, c->right, c->retained ? (PyObject *)c->retained : Py_None, c->frame_delta);
++    }
++    Py_RETURN_NONE;
++}
++static PyObject *test_tui_scroll_sample(Screen *self, PyObject *args);
+ static PyMethodDef methods[] = {
++    {"test_tui_pane_scroll", (PyCFunction)test_tui_pane_scroll, METH_VARARGS, NULL},
++    {"test_tui_window_size", (PyCFunction)test_tui_window_size, METH_VARARGS, NULL},
++    {"test_tui_layer", (PyCFunction)test_tui_layer, METH_VARARGS, NULL},
++    {"test_tui_window_sample", (PyCFunction)test_tui_window_sample, METH_VARARGS, NULL},
++    {"test_tui_cursor", (PyCFunction)test_tui_cursor, METH_VARARGS, NULL},
++    {"test_tui_scroll_sample", (PyCFunction)test_tui_scroll_sample, METH_VARARGS, NULL},
+     METHODB(test_create_write_buffer, METH_NOARGS),
+     METHODB(test_commit_write_buffer, METH_VARARGS),
+     METHODB(test_parse_written_data, METH_VARARGS),
+@@ -7226,7 +8035,24 @@ static PyMethodDef methods[] = {
+     {NULL} /* Sentinel */
+ };
+ 
++static PyObject *
++test_tui_scroll_sample(Screen *self, PyObject *args) {
++    double seconds;
++    if (!PyArg_ParseTuple(args, "d", &seconds)) return NULL;
++    float position, velocity;
++    screen_tui_scroll_sample(self, self->tui_scroll.started_at + s_double_to_monotonic_t(seconds), &position, &velocity);
++    return Py_BuildValue("(ff)", position, velocity);
++}
++
++static PyObject *
++get_tui_scroll_state(Screen *self, void *closure UNUSED) {
++    float position, velocity;
++    screen_tui_scroll_sample(self, monotonic(), &position, &velocity);
++    return Py_BuildValue("(ffII)", position, velocity, self->tui_scroll.top, self->tui_scroll.bottom);
++}
++
+ static PyGetSetDef getsetters[] = {
++    {"tui_scroll_state", (getter)get_tui_scroll_state, NULL, "Prototype position, velocity and region", NULL},
+     GETSET(in_bracketed_paste_mode) GETSET(color_preference_notification) GETSET(auto_repeat_enabled) GETSET(focus_tracking_enabled)
+         GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(cursor_visible) GETSET(cursor_key_mode) GETSET(disable_ligatures)
+             GETSET(render_unfocused_cursor){NULL} /* Sentinel */
+@@ -7252,6 +8078,9 @@ static PyMemberDef members[] = {
+     {"main_linebuf", T_OBJECT_EX, offsetof(Screen, main_linebuf), READONLY, "main_linebuf"},
+     {"historybuf", T_OBJECT_EX, offsetof(Screen, historybuf), READONLY, "historybuf"},
+     {"scrolled_by", T_UINT, offsetof(Screen, scrolled_by), READONLY, "scrolled_by"},
++    {"tui_layers_active", T_BOOL, offsetof(Screen, tui_layers.active), READONLY, "Native retained grid composition enabled"},
++    {"tui_scene_snapshot", T_OBJECT, offsetof(Screen, tui_scene.snapshot), READONLY, "Retained transition scene"},
++    {"tui_scroll_cache", T_OBJECT, offsetof(Screen, tui_scroll.retained), READONLY, "Retained prototype rows"},
+     {"pixel_scroll_offset_y", T_UINT, offsetof(Screen, pixel_scroll_offset_y), READONLY, "pixel_scroll_offset_y"},
+     {"lines", T_UINT, offsetof(Screen, lines), READONLY, "lines"},
+     {"columns", T_UINT, offsetof(Screen, columns), READONLY, "columns"},
+diff --git a/kitty/screen.h b/kitty/screen.h
+index 262503380..147fd858f 100644
+--- a/kitty/screen.h
++++ b/kitty/screen.h
+@@ -11,6 +11,7 @@
+ #include "monotonic.h"
+ #include "line-buf.h"
+ #include "history.h"
++#include <math.h>
+ 
+ typedef enum ScrollTypes { SCROLL_LINE = -999999, SCROLL_PAGE, SCROLL_FULL } ScrollType;
+ 
+@@ -118,11 +119,68 @@ typedef struct ExtraCursors {
+ } ExtraCursors;
+ 
+ 
++#define TUI_WINDOW_SLOTS 32
++typedef struct {
++    unsigned open_top, open_bottom, open_left, open_right, open_id, priority, border_mask, buffer_id;
++    float open_x, open_y, open_vx, open_vy;
++    float size_x, size_y, size_vx, size_vy;
++    bool closing, quick_motion;
++    monotonic_t open_at;
++} TUIWindowMotion;
++
++typedef struct {
++    LineBuf *current, *pending;
++    bool seen;
++} TUIRetainedLayer;
++
++typedef struct {
++    unsigned top, bottom, left, right, owner_id, buffer_id;
++    float offset, velocity, bounce_strength, bounce_duration;
++    monotonic_t started_at, last_input_at;
++    LineBuf *retained, *scratch, *frame_source;
++    int frame_delta;
++} TUIScrollContext;
++
+ typedef struct {
+     PyObject_HEAD
+ 
+         unsigned int columns,
+         lines, margin_top, margin_bottom, scrolled_by, pixel_scroll_offset_y;
++    // Private OSC 9911 prototype: retain and animate a rectangular TUI region.
++    struct {
++        unsigned top, bottom, left, right, owner_id;
++        bool enabled;
++        float offset, velocity;
++        monotonic_t started_at, last_input_at;
++        LineBuf *retained, *scratch;
++    } tui_scroll;
++    TUIScrollContext tui_pane_scroll[TUI_WINDOW_SLOTS];
++    TUIScrollContext tui_frozen_scroll[TUI_WINDOW_SLOTS];
++    struct {
++        LineBuf *snapshot;
++        unsigned top, bottom, left, right;
++        TUIWindowMotion windows[TUI_WINDOW_SLOTS];
++        unsigned last_window_slot, cursor_owner_id;
++        monotonic_t started_at, frame_at;
++        unsigned frames;
++        double frame_sum, frame_max;
++        bool cursor_initialized, cursor_moving, cursor_layout_changed;
++        float x, y, vx, vy, target_x, target_y;
++        monotonic_t cursor_at;
++    } tui_scene;
++    struct {
++        TUIRetainedLayer layers[TUI_WINDOW_SLOTS + 1];
++        bool inventory, pending_commit, active, overflow, frozen;
++        unsigned focused_owner_id, pending_focused_owner_id;
++        TUIWindowMotion frozen_windows[TUI_WINDOW_SLOTS];
++        unsigned frozen_retained_rows, frozen_scroll_rect[4], frozen_owner_id;
++        float frozen_scroll_offset, frozen_cursor_x, frozen_cursor_y;
++        LineBuf *discard;
++        LineBuf *saved_linebuf;
++        Cursor saved_cursor;
++    } tui_layers;
++    float tui_bounce_strength, tui_bounce_duration;
++    monotonic_t tui_update_started_at;
+     CellPixelSize cell_size;
+     OverlayLine overlay_line;
+     id_type window_id;
+@@ -229,8 +287,110 @@ typedef struct {
+     } dnd_chunking;
+ } Screen;
+ 
++// Bounded underdamped settling shared by native scrolling and pane translation.
++static inline void
++tui_surface_sample(float offset, float initial_velocity, float t, float limit, float strength, float duration, float *position, float *velocity) {
++    if (duration <= 0.f) { duration = 1.f; strength = 1.f; }
++    t /= duration; initial_velocity *= duration;
++    if (t >= .5f) { *position = *velocity = 0.f; return; }
++    const float damping = 16.f, frequency = 16.f;
++    float decay = expf(-damping * t), wave = frequency * t;
++    float b = (initial_velocity + damping * offset) / frequency;
++    *position = (offset * cosf(wave) + b * sinf(wave)) * decay;
++    *velocity = ((-frequency * offset - damping * b) * sinf(wave) +
++                 (frequency * b - damping * offset) * cosf(wave)) * decay;
++    if (strength == 0.f) {
++        float b = initial_velocity + damping * offset;
++        *position = (offset + b * t) * decay;
++        *velocity = (initial_velocity - damping * b * t) * decay;
++    } else if (offset * *position < 0.f) {
++        *position *= strength; *velocity *= strength;
++        if (fabsf(*position) > limit * strength) {
++            *position = copysignf(limit * strength, *position); *velocity = 0.f;
++        }
++    }
++    *velocity /= duration;
++}
++
++// Analytic bounded settling. Retargeting samples position and velocity,
++// independent of frame rate. Touchpad input can hold a direct position
++// briefly by setting started_at in the future.
++static inline void
++screen_tui_scroll_sample(const Screen *s, monotonic_t now, float *position, float *velocity) {
++    *position = *velocity = 0.f;
++    if (!s->tui_scroll.started_at || s->linebuf != s->alt_linebuf) return;
++    float t = MAX(0.f, (float)monotonic_t_to_s_double(now - s->tui_scroll.started_at));
++    tui_surface_sample(s->tui_scroll.offset, s->tui_scroll.velocity, t, .12f, s->tui_bounce_strength, s->tui_bounce_duration, position, velocity);
++}
++
++static inline float
++screen_tui_scroll_offset(const Screen *s, monotonic_t now) {
++    float position, velocity;
++    screen_tui_scroll_sample(s, now, &position, &velocity);
++    return position;
++}
++
++static inline void
++screen_tui_pane_scroll_sample(const TUIScrollContext *c, monotonic_t now, float *position, float *velocity) {
++    *position = *velocity = 0.f;
++    if (!c->started_at) return;
++    float t = MAX(0.f, (float)monotonic_t_to_s_double(now - c->started_at));
++    tui_surface_sample(c->offset, c->velocity, t, .12f, c->bounce_strength, c->bounce_duration, position, velocity);
++}
++static inline const TUIScrollContext *screen_tui_render_scroll(const Screen *s, unsigned slot) {
++    return s->paused_rendering.expires_at && s->tui_layers.frozen ? &s->tui_frozen_scroll[slot] : &s->tui_pane_scroll[slot];
++}
++static inline unsigned screen_tui_pane_retained_rows(const Screen *s) {
++    if (s->linebuf != s->alt_linebuf || (s->paused_rendering.expires_at && !s->tui_layers.frozen)) return 0;
++    unsigned rows = 0;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        const TUIScrollContext *c = screen_tui_render_scroll(s, i);
++        if (c->retained && c->retained->xnum == s->columns && c->retained->ynum == 2 * s->lines) rows += 2 * s->lines;
++    }
++    return rows;
++}
++void screen_tui_pane_scroll_update(Screen *s, unsigned owner, unsigned top, unsigned bottom, unsigned left, unsigned right, int delta);
++bool screen_tui_pane_scroll_tick(Screen *s, monotonic_t now);
++void screen_tui_pane_scroll_clear(TUIScrollContext *c);
++
++static inline unsigned
++screen_tui_retained_rows(const Screen *s) {
++    if (s->paused_rendering.expires_at && s->tui_layers.frozen) return s->tui_layers.frozen_retained_rows;
++    return !s->paused_rendering.expires_at && s->linebuf == s->alt_linebuf && s->tui_scroll.retained &&
++        s->tui_scroll.retained->xnum == s->columns && s->tui_scroll.retained->ynum == 2 * s->lines ? 2 * s->lines : 0;
++}
++
+ #define pixel_scroll_enabled(screen) (OPT(pixel_scroll) && !screen->paused_rendering.expires_at && screen->linebuf == screen->main_linebuf)
+-#define render_lines_for_screen(screen) (screen->lines + pixel_scroll_enabled(screen))
++static inline unsigned screen_tui_scene_rows(const Screen *s) {
++    return s->tui_scene.snapshot && s->linebuf == s->alt_linebuf && !s->paused_rendering.expires_at ? s->lines : 0;
++}
++static inline unsigned screen_tui_layer_rows(const Screen *s) {
++    if (!s->tui_layers.active || (s->paused_rendering.expires_at && !s->tui_layers.frozen)) return 0;
++    unsigned count = 0;
++    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) if (s->tui_layers.layers[i].current) count++;
++    return count * s->lines;
++}
++#define render_lines_for_screen(screen) (screen->lines + pixel_scroll_enabled(screen) + screen_tui_retained_rows(screen) + screen_tui_scene_rows(screen) + screen_tui_layer_rows(screen) + screen_tui_pane_retained_rows(screen))
++static inline const TUIWindowMotion *screen_tui_render_window(const Screen *s, unsigned slot) {
++    return s->paused_rendering.expires_at && s->tui_layers.frozen ? &s->tui_layers.frozen_windows[slot] : &s->tui_scene.windows[slot];
++}
++void screen_tui_layers_begin(Screen *s);
++void screen_tui_layer_geometry(Screen *s, unsigned id, unsigned top, unsigned bottom, unsigned left, unsigned right, unsigned priority);
++void screen_tui_layer_select(Screen *s, unsigned id, unsigned top, unsigned left, unsigned width, unsigned height, unsigned priority);
++void screen_tui_layer_end(Screen *s);
++void screen_tui_layers_commit(Screen *s);
++void screen_tui_scene_reset(Screen *s);
++void screen_tui_scene_capture(Screen *s, unsigned top, unsigned bottom, unsigned left, unsigned right);
++bool screen_tui_scene_tick(Screen *s, monotonic_t now);
++void screen_tui_cursor_sample(Screen *s, monotonic_t now, float *x, float *y);
++void screen_tui_window_size_sample(const Screen *s, unsigned slot, monotonic_t now, float *width, float *height, float *vx, float *vy);
++void screen_tui_window_sample(const Screen *s, monotonic_t now, float *x, float *y, float *vx, float *vy);
++void screen_tui_window_sample_slot(const Screen *s, unsigned slot, monotonic_t now, float *x, float *y, float *vx, float *vy);
++bool screen_tui_windows_active(const Screen *s);
++void screen_tui_window_update(Screen *s, unsigned top, unsigned bottom, unsigned left, unsigned right, float dx, float dy, unsigned id, unsigned priority);
++
++void screen_tui_scroll_reset(Screen *self);
++void screen_tui_scroll_update(Screen *self, unsigned top, unsigned bottom, unsigned left, unsigned right, int delta);
+ 
+ void screen_align(Screen *);
+ void screen_garbage_collect_text_cache(Screen *screen);
+diff --git a/kitty/shaders.c b/kitty/shaders.c
+index 5cb7cf637..5ded3aabf 100644
+--- a/kitty/shaders.c
++++ b/kitty/shaders.c
+@@ -924,6 +924,7 @@ cell_update_uniform_block(
+     OSWindow *os_window,
+     float inactive_text_alpha,
+     float bg_alpha) {
++    const monotonic_t sample_at = monotonic();
+     struct GPUCellRenderData {
+         // Colors that are constant for the whole draw, pre-converted to linear
+         // space so the vertex shader does not do a gamma LUT lookup for them
+@@ -941,9 +942,18 @@ cell_update_uniform_block(
+         GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
+         GLfloat cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
+ 
++        GLfloat tui_scroll_offset, tui_scroll_top, tui_scroll_bottom, tui_scroll_left;
++        GLfloat tui_scroll_right, tui_scene_base, tui_scene_alpha, tui_scene_padding;
++        GLfloat tui_scene_top, tui_scene_bottom, tui_scene_left, tui_scene_right;
++        GLfloat tui_window_align0, tui_window_align1;
++        GLfloat tui_window_rects[TUI_WINDOW_SLOTS][4], tui_window_motion[TUI_WINDOW_SLOTS][4], tui_window_size[TUI_WINDOW_SLOTS][4];
++        GLfloat tui_pane_scroll_rects[TUI_WINDOW_SLOTS][4], tui_pane_scroll_motion[TUI_WINDOW_SLOTS][4];
++        GLfloat tui_cursor_left, tui_cursor_top, tui_cursor_right, tui_cursor_bottom;
++        GLfloat tui_cursor_alpha, tui_cursor_kind, tui_cursor_reserved0, tui_cursor_reserved1;
+         GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
+         GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+     };
++    _Static_assert(offsetof(struct GPUCellRenderData, tui_window_rects) % 16 == 0, "std140 window array alignment");
+     // Send the uniform data
+     ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
+     if (cp->dirty || screen->reload_all_gpu_data) {
+@@ -978,6 +988,38 @@ cell_update_uniform_block(
+     rd->bg_opacities0 = bg_alpha;
+     rd->fg_override_threshold = OPT(text_fg_override_threshold);
+     rd->row_offset = row_offset_for_screen(screen);
++    rd->tui_scroll_offset = screen->paused_rendering.expires_at ? (screen->tui_layers.frozen ? screen->tui_layers.frozen_scroll_offset : 0.f) : screen_tui_scroll_offset(screen, sample_at);
++    // Move by device pixels, keeping bitmap glyphs crisp between grid rows.
++    if (screen->cell_size.height) rd->tui_scroll_offset = roundf(rd->tui_scroll_offset * screen->cell_size.height) / screen->cell_size.height;
++    rd->tui_scroll_top = screen->tui_scroll.top;
++    rd->tui_scroll_bottom = screen->tui_scroll.bottom;
++    rd->tui_scroll_left = screen->tui_scroll.left;
++    rd->tui_scroll_right = screen->tui_scroll.right;
++    if (screen->paused_rendering.expires_at && screen->tui_layers.frozen) {
++        rd->tui_scroll_top = screen->tui_layers.frozen_scroll_rect[0];
++        rd->tui_scroll_bottom = screen->tui_layers.frozen_scroll_rect[1];
++        rd->tui_scroll_left = screen->tui_layers.frozen_scroll_rect[2];
++        rd->tui_scroll_right = screen->tui_layers.frozen_scroll_rect[3];
++    }
++    rd->tui_scene_base = screen_tui_scene_rows(screen) ? screen->lines + screen_tui_retained_rows(screen) : 1e9f;
++    float progress = screen->tui_scene.started_at ? MIN(1.f, (float)monotonic_t_to_s_double(sample_at - screen->tui_scene.started_at) / .180f) : 1.f;
++    rd->tui_scene_alpha = 1.f - progress * progress * (3.f - 2.f * progress);
++    rd->tui_scene_padding = screen->paused_rendering.expires_at && screen->tui_layers.frozen ? 1.f : (!screen->paused_rendering.expires_at && !screen->tui_layers.overflow && (screen_tui_windows_active(screen) || screen->tui_layers.active) ? 1.f : 0.f);
++    rd->tui_window_align0 = rd->tui_window_align1 = 0;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        const TUIWindowMotion *w = screen_tui_render_window(screen, i);
++        float vx, vy;
++        screen_tui_window_sample_slot(screen, i, sample_at, &rd->tui_window_motion[i][0], &rd->tui_window_motion[i][1], &vx, &vy);
++        rd->tui_window_rects[i][0] = w->open_left; rd->tui_window_rects[i][1] = w->open_top;
++        rd->tui_window_rects[i][2] = w->open_right; rd->tui_window_rects[i][3] = w->open_bottom;
++        screen_tui_window_size_sample(screen, i, sample_at, &rd->tui_window_size[i][0], &rd->tui_window_size[i][1], &vx, &vy);
++        rd->tui_window_size[i][2] = w->closing;
++        rd->tui_window_size[i][3] = w->border_mask;
++        rd->tui_window_motion[i][2] = w->priority * TUI_WINDOW_SLOTS + i + (w->closing && !w->priority ? TUI_WINDOW_SLOTS : 0);
++        rd->tui_window_motion[i][3] = rd->tui_scene_padding > 0.f && w->open_bottom > w->open_top;
++    }
++    rd->tui_scene_top = screen->tui_scene.top; rd->tui_scene_bottom = screen->tui_scene.bottom;
++    rd->tui_scene_left = screen->tui_scene.left; rd->tui_scene_right = screen->tui_scene.right;
+ #define SETBG(which) \
+     { colorprofile_to_transparent_color(cp, which - 1, &rd->bg_colors##which, &rd->bg_opacities##which); }
+     SETBG(1);
+@@ -1087,6 +1129,73 @@ cell_update_uniform_block(
+         rd->cursor_y2 = screen->lines;
+     }
+ 
++    memset(rd->tui_pane_scroll_rects, 0, sizeof(rd->tui_pane_scroll_rects));
++    memset(rd->tui_pane_scroll_motion, 0, sizeof(rd->tui_pane_scroll_motion));
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++        const TUIScrollContext *c = screen_tui_render_scroll(screen, i);
++        if (!c->owner_id || !c->retained) continue;
++        for (unsigned slot = 0; slot < TUI_WINDOW_SLOTS; slot++) {
++            const TUIWindowMotion *w = screen_tui_render_window(screen, slot);
++            if (w->open_id != c->owner_id || w->closing) continue;
++            float position, velocity;
++            screen_tui_pane_scroll_sample(c, screen->paused_rendering.expires_at ? c->started_at : sample_at, &position, &velocity);
++            if (screen->cell_size.height) position = roundf(position * screen->cell_size.height) / screen->cell_size.height;
++            rd->tui_pane_scroll_rects[slot][0] = c->left; rd->tui_pane_scroll_rects[slot][1] = c->top;
++            rd->tui_pane_scroll_rects[slot][2] = c->right; rd->tui_pane_scroll_rects[slot][3] = c->bottom;
++            rd->tui_pane_scroll_motion[slot][0] = position;
++            rd->tui_pane_scroll_motion[slot][1] = 1.f;
++        }
++    }
++    bool cursor_layout_moving = false;
++    if (screen->tui_layers.active) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIWindowMotion *w = screen_tui_render_window(screen, i);
++            if (!w->open_bottom || w->open_id != screen->tui_layers.focused_owner_id) continue;
++            float dx, dy, vx, vy;
++            screen_tui_window_sample_slot(screen, i, sample_at, &dx, &dy, &vx, &vy);
++            if (fabsf(dx) + fabsf(dy) > .001f) { cursor_layout_moving = true; break; }
++        }
++    }
++    rd->tui_cursor_alpha = 0;
++    rd->tui_cursor_kind = cursor->shape;
++    rd->tui_cursor_left = rd->tui_cursor_top = rd->tui_cursor_right = rd->tui_cursor_bottom = 0;
++    rd->tui_cursor_reserved0 = rd->tui_cursor_reserved1 = 0;
++    if (!cursor_layout_moving && (!screen->paused_rendering.expires_at || screen->tui_layers.frozen) && screen->tui_scroll.enabled && cursor->is_visible && cursor->is_focused && cursor->shape != NO_CURSOR_SHAPE &&
++        (screen->tui_layers.active || screen->tui_scene.cursor_moving || screen->tui_scene.snapshot || screen_tui_windows_active(screen))) {
++        float x = cursor->x, y = cursor->y;
++        if (screen->paused_rendering.expires_at && screen->tui_layers.frozen) { x = screen->tui_layers.frozen_cursor_x; y = screen->tui_layers.frozen_cursor_y; }
++        else if (!OPT(cursor_trail) && screen->tui_scene.cursor_moving) screen_tui_cursor_sample(screen, sample_at, &x, &y);
++        if (cursor->x >= screen->tui_scroll.left && cursor->x < screen->tui_scroll.right && cursor->y >= screen->tui_scroll.top && cursor->y < screen->tui_scroll.bottom)
++            y += rd->tui_scroll_offset;
++        int cursor_window = -1;
++        unsigned cursor_priority = 0;
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIWindowMotion *w = screen_tui_render_window(screen, i);
++            unsigned priority = w->priority * TUI_WINDOW_SLOTS + i;
++            if (!w->closing && (!screen->tui_layers.focused_owner_id || w->open_id == screen->tui_layers.focused_owner_id) && cursor->x >= w->open_left && cursor->x < w->open_right && cursor->y >= w->open_top && cursor->y < w->open_bottom &&
++                (cursor_window < 0 || priority > cursor_priority)) { cursor_window = i; cursor_priority = priority; }
++        }
++        rd->tui_cursor_reserved0 = (GLfloat)(cursor_window + 1);
++        if (cursor_window >= 0) {
++            const GLfloat *rect = rd->tui_pane_scroll_rects[cursor_window];
++            if (rd->tui_pane_scroll_motion[cursor_window][1] > 0.f && cursor->x >= rect[0] && cursor->x < rect[2] && cursor->y >= rect[1] && cursor->y < rect[3]) y += rd->tui_pane_scroll_motion[cursor_window][0];
++            float dx, dy, vx, vy;
++            screen_tui_window_sample_slot(screen, cursor_window, sample_at, &dx, &dy, &vx, &vy);
++            x += dx; y += dy;
++        }
++        float width = rd->cursor_x2 >= rd->cursor_x1 ? rd->cursor_x2 - rd->cursor_x1 + 1 : 1;
++        float height = rd->cursor_y2 >= rd->cursor_y1 ? rd->cursor_y2 - rd->cursor_y1 + 1 : 1;
++        if (cursor->shape == CURSOR_BEAM) width = .15f;
++        if (cursor->shape == CURSOR_UNDERLINE) { y += height - .15f; height = .15f; }
++        rd->tui_cursor_left = x; rd->tui_cursor_top = y;
++        rd->tui_cursor_right = x + width; rd->tui_cursor_bottom = y + height;
++        rd->tui_cursor_alpha = rd->cursor_opacity;
++
++    }
++    if (rd->tui_cursor_alpha > 0 || cursor_layout_moving) {
++        rd->cursor_x1 = screen->columns + 1; rd->cursor_x2 = screen->columns;
++        rd->cursor_y1 = screen->lines + 1; rd->cursor_y2 = screen->lines;
++    }
+     rd->columns = screen->columns;
+     rd->lines = screen->lines;
+ 
+@@ -1143,7 +1252,7 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
+     }
+ 
+     if (screen->paused_rendering.expires_at) {
+-        if (!screen->paused_rendering.cell_data_updated) update_cell_data;
++        if (!screen->paused_rendering.cell_data_updated && !screen->tui_layers.frozen) update_cell_data;
+     } else if (screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || (disable_ligatures && cursor_pos_changed))
+         update_cell_data;
+ 
+@@ -1909,6 +2018,8 @@ current_framebuffer_is_ok(void) {
+ 
+ enum { DRAW_NEITHER_BG = 0, DRAW_DEFAULT_BG = 1, DRAW_NON_DEFAULT_BG = 2, DRAW_BOTH_BG = 3 };
+ 
++static void configure_cell_vao_attributes(ssize_t vao_idx, unsigned int base_cell, unsigned int cell_step);
++
+ static void
+ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output, unsigned draw_bg_bitfield) {
+     bind_program(program);
+@@ -1917,7 +2028,81 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
+     bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
+     glUniform1ui(program_uniform_location(program, "draw_bg_bitfield"), draw_bg_bitfield);
+     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
+-    draw_quad(!for_final_output, render_lines_for_screen(ui->screen) * ui->screen->columns);
++    Screen *screen = ui->screen;
++    int mode_loc = program_uniform_location(program, "tui_layer_mode");
++    int slot_loc = program_uniform_location(program, "tui_layer_slot");
++    glUniform1i(mode_loc, 0);
++    glUniform1i(slot_loc, 0);
++    int scroll_owner = -1;
++    unsigned owner_id = screen->paused_rendering.expires_at && screen->tui_layers.frozen ? screen->tui_layers.frozen_owner_id : screen->tui_scroll.owner_id;
++    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++)
++        if (owner_id && screen_tui_render_window(screen, i)->open_id == owner_id) scroll_owner = (int)i;
++    glUniform1i(program_uniform_location(program, "tui_scroll_owner"), scroll_owner);
++    if (screen_tui_layer_rows(screen)) {
++        unsigned legacy_rows = screen->lines + screen_tui_retained_rows(screen) + screen_tui_scene_rows(screen);
++        unsigned native_base = legacy_rows * screen->columns;
++        configure_cell_vao_attributes(vao_idx, native_base, 1);
++        glUniform1ui(program_uniform_location(program, "instance_offset"), 0);
++        glUniform1i(mode_loc, 1);
++        draw_quad(!for_final_output, screen->lines * screen->columns);
++        unsigned retained = screen_tui_retained_rows(screen);
++        if (retained) {
++            if (scroll_owner >= 0) { glUniform1i(mode_loc, 2); glUniform1i(slot_loc, scroll_owner); }
++            configure_cell_vao_attributes(vao_idx, screen->lines * screen->columns, 1);
++            glUniform1ui(program_uniform_location(program, "instance_offset"), screen->lines * screen->columns);
++            draw_quad(!for_final_output, retained * screen->columns);
++        }
++        glUniform1ui(program_uniform_location(program, "instance_offset"), 0);
++        glUniform1i(mode_loc, 2);
++        unsigned packed = 1;
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIWindowMotion *w = screen_tui_render_window(screen, i);
++            LineBuf *layer = screen->tui_layers.layers[i].current;
++            unsigned layer_index = packed;
++            if (layer) packed++;
++            if (!w->open_bottom) continue;
++            if (!layer && !w->open_at) continue;
++            unsigned base = layer ? (legacy_rows + layer_index * screen->lines) * screen->columns : native_base;
++            configure_cell_vao_attributes(vao_idx, base, 1);
++            glUniform1i(slot_loc, i);
++            // Higher layers are clipped by identity, so replacement preserves
++            // terminal background transparency without stacking it repeatedly.
++            draw_quad(program == CELL_FG_PROGRAM, screen->lines * screen->columns);
++        }
++        unsigned pane_base = legacy_rows + screen_tui_layer_rows(screen);
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIScrollContext *c = screen_tui_render_scroll(screen, i);
++            if (!c->retained || c->retained->xnum != screen->columns || c->retained->ynum != 2 * screen->lines) continue;
++            int owner_slot = -1;
++            for (unsigned j = 0; j < TUI_WINDOW_SLOTS; j++) if (screen_tui_render_window(screen, j)->open_id == c->owner_id) owner_slot = (int)j;
++            if (owner_slot >= 0 && !screen_tui_render_window(screen, owner_slot)->closing) {
++                configure_cell_vao_attributes(vao_idx, pane_base * screen->columns, 1);
++                glUniform1ui(program_uniform_location(program, "instance_offset"), screen->lines * screen->columns);
++                glUniform1i(mode_loc, 2); glUniform1i(slot_loc, owner_slot);
++                draw_quad(program == CELL_FG_PROGRAM, 2 * screen->lines * screen->columns);
++            }
++            pane_base += 2 * screen->lines;
++        }
++        configure_cell_vao_attributes(vao_idx, 0, 1);
++        glUniform1ui(program_uniform_location(program, "instance_offset"), 0);
++        glUniform1i(mode_loc, 0);
++        if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
++        return;
++    }
++    unsigned scene_rows = screen_tui_scene_rows(ui->screen);
++    unsigned live_rows = render_lines_for_screen(ui->screen) - scene_rows;
++    glUniform1ui(program_uniform_location(program, "instance_offset"), 0);
++    draw_quad(!for_final_output, live_rows * ui->screen->columns);
++    if (scene_rows) {
++        unsigned base_cell = live_rows * ui->screen->columns;
++        configure_cell_vao_attributes(vao_idx, base_cell, 1);
++        glUniform1ui(program_uniform_location(program, "instance_offset"), base_cell);
++        // Replace the empty destination, preserving its premultiplied alpha.
++        // A separate foreground pass still blends its glyphs over the backdrop.
++        draw_quad(program == CELL_FG_PROGRAM, scene_rows * ui->screen->columns);
++        configure_cell_vao_attributes(vao_idx, 0, 1);
++        glUniform1ui(program_uniform_location(program, "instance_offset"), 0);
++    }
+     if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
+ }
+ 
+@@ -2264,6 +2449,16 @@ draw_cells(
+     save_viewport_using_top_left_origin(ui.screen_left, ui.screen_top, ui.screen_width, ui.screen_height, ui.full_framebuffer_height);
+     if (ui.os_window->needs_layers) draw_cells_with_layers(&ui, srd->vao_idx);
+     else draw_cells_without_layers(&ui, srd->vao_idx);
++    // Rendered frame intervals, not monitor presentation timestamps.
++    if (screen_tui_pane_retained_rows(screen) || screen->tui_scroll.started_at || screen->tui_scene.snapshot || screen_tui_windows_active(screen) || screen->tui_scene.cursor_moving) {
++        if (screen->tui_scene.frame_at && now - screen->tui_scene.frame_at < ms_to_monotonic_t(150)) {
++            double gap = monotonic_t_to_s_double(now - screen->tui_scene.frame_at);
++            screen->tui_scene.frame_sum += gap;
++            screen->tui_scene.frame_max = MAX(screen->tui_scene.frame_max, gap);
++            screen->tui_scene.frames++;
++        }
++        screen->tui_scene.frame_at = now;
++    } else screen->tui_scene.frame_at = 0;
+     restore_viewport();
+     // The compensatory padding lies outside the per-window cell viewport, so it
+     // is drawn after restoring the full framebuffer viewport.
+diff --git a/kitty/shaders/background.slang b/kitty/shaders/background.slang
+index cdd598be1..5bcb6a521 100644
+--- a/kitty/shaders/background.slang
++++ b/kitty/shaders/background.slang
+@@ -37,6 +37,14 @@ public struct CellRenderData {
+     public float cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
+ 
+     // must have unique entries with 0 being default_bg and unset being UINT32_MAX
++    public float tui_scroll_offset, tui_scroll_top, tui_scroll_bottom, tui_scroll_left;
++    public float tui_scroll_right, tui_scene_base, tui_scene_alpha, tui_scene_padding;
++    public float tui_scene_top, tui_scene_bottom, tui_scene_left, tui_scene_right;
++    public float tui_window_align0, tui_window_align1;
++    public float4 tui_window_rects[32], tui_window_motion[32], tui_window_size[32];
++    public float4 tui_pane_scroll_rects[32], tui_pane_scroll_motion[32];
++    public float tui_cursor_left, tui_cursor_top, tui_cursor_right, tui_cursor_bottom;
++    public float tui_cursor_alpha, tui_cursor_kind, tui_cursor_reserved0, tui_cursor_reserved1;
+     public uint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
+     public float bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+ };
+diff --git a/kitty/shaders/cell.slang b/kitty/shaders/cell.slang
+index d783d3c16..3614fa745 100644
+--- a/kitty/shaders/cell.slang
++++ b/kitty/shaders/cell.slang
+@@ -23,6 +23,7 @@ static const bool ONLY_BACKGROUND = RENDER_MODE == 1;
+ // that they can be shared with the padding shader.
+ 
+ uniform Sampler2D<uint4> sprite_decorations_map;
++// 0: flattened fallback, 1: native base grid, 2: identified native layer.
+ 
+ static const uint SPRITE_INDEX_MASK = 0x7fffffff;
+ static const uint SPRITE_COLORED_MASK = 0x80000000;
+@@ -31,6 +32,13 @@ static const uint SPRITE_COLORED_SHIFT = 31u;
+ struct VertexOutput {
+     float4 position : SV_Position;
+ 
++    float2 smooth_position;
++    nointerpolation float smooth_active;
++    nointerpolation float2 scroll_clip;
++    nointerpolation float smooth_reject;
++    nointerpolation float2 resize_scale;
++    nointerpolation float2 resize_origin;
++    nointerpolation float2 resize_shift;
+     float3 background;
+     float4 effective_background_premul;
+     float effective_text_alpha;
+@@ -143,11 +151,100 @@ vertex_main(
+     [[vk::location(2)]] uint is_selected,
+     uint vertex_id: SV_VertexID,
+     uint instance_id: SV_InstanceID,
+-    uniform uint draw_bg_bitfield, ) {
++    uniform uint draw_bg_bitfield, uniform uint instance_offset,
++    uniform int tui_layer_mode, uniform int tui_layer_slot, uniform int tui_scroll_owner, ) {
+     VertexOutput vo;
++    instance_id += instance_offset;
+ 
+     BackgroundOutput bo = compute_background(colors, sprite_idx, is_selected, instance_id, vertex_id);
+     vo.position = bo.position;
++    vo.resize_scale = float2(1, 1);
++    vo.resize_origin = float2(0, 0);
++    vo.resize_shift = float2(0, 0);
++    float raw_row = float(instance_id / crd.columns);
++    float row = raw_row;
++    bool scene = raw_row >= crd.tui_scene_base;
++    // Main-screen pixel scrolling includes an extra live row. It is not a
++    // retained TUI row: clipping it exposes the canvas at the bottom edge.
++    bool retained = !scene && raw_row >= float(crd.lines)
++        && (tui_layer_mode == 2 || crd.tui_scroll_bottom > crd.tui_scroll_top);
++    float column = float(instance_id % crd.columns);
++    int pane_scroll = -1;
++    if (tui_layer_mode == 2 && crd.tui_pane_scroll_motion[tui_layer_slot].y > 0) pane_scroll = tui_layer_slot;
++    if (tui_layer_mode == 1) {
++        for (int i = 0; i < 32; i++) {
++            float4 rect = crd.tui_pane_scroll_rects[i];
++            if (crd.tui_pane_scroll_motion[i].y > 0 && crd.tui_window_motion[i].z < 32.0 && column >= rect.x && column < rect.z && row >= rect.y && row < rect.w) pane_scroll = i;
++        }
++    }
++    float4 scroll_rect = pane_scroll >= 0 ? crd.tui_pane_scroll_rects[pane_scroll] : float4(crd.tui_scroll_left, crd.tui_scroll_top, crd.tui_scroll_right, crd.tui_scroll_bottom);
++    if (retained) {
++        row = raw_row < 2.0 * float(crd.lines)
++            ? scroll_rect.y + raw_row - 2.0 * float(crd.lines)
++            : scroll_rect.w + raw_row - 2.0 * float(crd.lines);
++    }
++    bool in_columns = column >= scroll_rect.x && column < scroll_rect.z;
++    vo.smooth_reject = retained && !in_columns ? -1.0 : 1.0;
++    vo.smooth_active = float(in_columns && (retained || (row >= scroll_rect.y && row < scroll_rect.w)));
++    bool scroll_owner = pane_scroll >= 0 || tui_layer_mode == 0 || (tui_layer_mode == 1 && tui_scroll_owner < 0) || (tui_layer_mode == 2 && tui_scroll_owner == tui_layer_slot);
++    float scroll_offset = pane_scroll >= 0 ? crd.tui_pane_scroll_motion[pane_scroll].x : crd.tui_scroll_offset;
++    float offset = row - raw_row + (scroll_owner ? vo.smooth_active * scroll_offset : 0.0);
++    vo.scroll_clip = vo.smooth_active > 0 && scroll_owner ? scroll_rect.yw : float2(-100000.0, 100000.0);
++    if (pane_scroll >= 0) vo.scroll_clip += crd.tui_window_motion[pane_scroll].y;
++    int moving_slot = -1;
++    float moving_priority = -1;
++    if (!retained && !scene) {
++        if (tui_layer_mode == 2) {
++            float4 rect = crd.tui_window_rects[tui_layer_slot];
++            vo.smooth_reject = column >= rect.x && column < rect.z && row >= rect.y && row < rect.w ? 1.0 : -1.0;
++            moving_slot = tui_layer_slot;
++        }
++        for (int i = 0; i < 32 && crd.tui_scene_padding > 0; i++) {
++            float4 rect = crd.tui_window_rects[i];
++            float4 motion = crd.tui_window_motion[i];
++            if (tui_layer_mode == 0 && motion.w > 0 && column >= rect.x && column < rect.z && row >= rect.y && row < rect.w && motion.z > moving_priority) {
++                moving_slot = i; moving_priority = motion.z;
++            }
++        }
++        if (moving_slot >= 0) {
++            offset += crd.tui_window_motion[moving_slot].y;
++            vo.position.x += crd.tui_window_motion[moving_slot].x * 2.0 / float(crd.columns);
++            vo.smooth_active = -1.0 - float(moving_slot);
++        }
++    }
++    if (retained && tui_layer_mode == 2) {
++        offset += crd.tui_window_motion[tui_layer_slot].y;
++        vo.position.x += crd.tui_window_motion[tui_layer_slot].x * 2.0 / float(crd.columns);
++    }
++    if (scene) {
++        row = raw_row - crd.tui_scene_base;
++        offset = row - raw_row;
++        vo.smooth_active = 2;
++        vo.smooth_reject = row >= crd.tui_scene_top && row < crd.tui_scene_bottom && column >= crd.tui_scene_left && column < crd.tui_scene_right ? 1.0 : -1.0;
++    }
++    vo.position.y -= offset * 2.0 / float(crd.lines);
++    if (tui_layer_mode == 2 && !retained && !scene) {
++        float4 rect = crd.tui_window_rects[tui_layer_slot];
++        float2 size_delta = crd.tui_window_size[tui_layer_slot].xy - (rect.zw - rect.xy);
++        float2 extension = max(float2(0, 0), size_delta);
++        uint borders = uint(crd.tui_window_size[tui_layer_slot].w);
++        if (column == rect.z - 1) vo.resize_scale.x += extension.x;
++        if (row == rect.w - 1) vo.resize_scale.y += extension.y;
++        vo.resize_origin = float2(column, row) + crd.tui_window_motion[tui_layer_slot].xy;
++        if ((borders & 2u) != 0 && column == rect.z - 1) {
++            vo.position.x += min(0.0, size_delta.x) * 2.0 / float(crd.columns);
++            vo.resize_origin.x += size_delta.x;
++            vo.resize_shift.x = max(0.0, size_delta.x);
++        }
++        if ((borders & 4u) != 0 && row == rect.w - 1) {
++            vo.position.y -= min(0.0, size_delta.y) * 2.0 / float(crd.lines);
++            vo.resize_origin.y += size_delta.y;
++            vo.resize_shift.y = max(0.0, size_delta.y);
++        }
++        if (bo.cell_data.pos.x > 0) vo.position.x += (vo.resize_scale.x - 1) * 2.0 / float(crd.columns);
++        if (bo.cell_data.pos.y > 0) vo.position.y -= (vo.resize_scale.y - 1) * 2.0 / float(crd.lines);
++    }
++    vo.smooth_position = float2((1.0 + vo.position.x) * float(crd.columns) * .5, (1.0 - vo.position.y) * float(crd.lines) * .5);
+     float3 background_rgb = bo.background_rgb;
+     float3 foreground = bo.foreground;
+     uint fg_as_uint = bo.fg_as_uint;
+@@ -298,15 +395,89 @@ adjust_foreground_contrast_with_background(float4 text_fg, float3 bg, float text
+ 
+ [shader("fragment")]
+ float4
+-fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_gamma_adjustment, )
++fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_gamma_adjustment,
++              uniform int tui_layer_mode, uniform int tui_layer_slot, )
+     : SV_Target {
++    if (vo.smooth_reject < 0.0) discard;
++    if (vo.smooth_position.y < vo.scroll_clip.x || vo.smooth_position.y >= vo.scroll_clip.y) discard;
++    int own_slot = tui_layer_mode == 2 ? tui_layer_slot : (vo.smooth_active < 0 ? int(-vo.smooth_active) - 1 : -1);
++    float own_priority = -1;
++    if (own_slot >= 0) own_priority = crd.tui_window_motion[own_slot].z;
++    bool in_own_window = false, covered_by_window = false, in_destination = false;
++    bool pane_gap_background = false;
++    for (int i = 0; i < 32 && crd.tui_scene_padding > 0; i++) {
++        float4 rect = crd.tui_window_rects[i];
++        float4 motion = crd.tui_window_motion[i];
++        if (motion.w == 0) continue;
++        bool normal_pane = motion.z < 32.0;
++        float2 size = crd.tui_window_size[i].xy;
++        bool moving = abs(motion.x) + abs(motion.y) + abs(size.x - (rect.z - rect.x)) + abs(size.y - (rect.w - rect.y)) > .001;
++        if (tui_layer_mode > 0 && normal_pane && !moving && i != own_slot) continue;
++        // The base owns editor contents underneath floats. A moving normal pane
++        // is drawn from its own base crop. Suppress fixed glyphs, but retain
++        // their background wherever motion exposes a gap in that destination.
++        if (tui_layer_mode == 1 && normal_pane && moving && all(vo.smooth_position >= rect.xy) && all(vo.smooth_position < rect.zw)) pane_gap_background = true;
++        bool inside = all(vo.smooth_position >= rect.xy + motion.xy) && all(vo.smooth_position < rect.xy + motion.xy + size);
++        if (i == own_slot) in_own_window = inside;
++        if (inside && motion.z > own_priority) covered_by_window = true;
++        // A flattened snapshot contains the old explorer itself, not the
++        // editor underneath it. Reusing it for floating-window gaps ghosts
++        // the old directory until the new window covers it.
++        in_destination = in_destination || (motion.z == 0 && all(vo.smooth_position >= rect.xy) && all(vo.smooth_position < rect.zw));
++    }
++    if (own_slot >= 0 && !in_own_window) discard;
++    if (vo.smooth_active != 2.0 && covered_by_window) discard;
++    // A translated pane must not cut a fully transparent hole through the
++    // terminal. Keep its native background without duplicating stationary text
++    // or stacking the opacity of overlapping animated surfaces.
++    if (pane_gap_background) return ONLY_FOREGROUND ? float4(0) : vo.effective_background_premul;
++    // The retained scene only fills holes left by translated live windows.
++    // Never fade a full terminal image over another transparent image.
++    if (vo.smooth_active == 2.0 && (covered_by_window || !in_destination)) discard;
++    // Expanded edge quads supply only background outside their original
++    // cell. Remap sprite coordinates inside that cell to keep glyph pixels
++    // unscaled while the enclosing background changes dimensions.
++    if ((vo.resize_scale.x > 1 && (vo.smooth_position.x < vo.resize_origin.x || vo.smooth_position.x >= vo.resize_origin.x + 1)) ||
++        (vo.resize_scale.y > 1 && (vo.smooth_position.y < vo.resize_origin.y || vo.smooth_position.y >= vo.resize_origin.y + 1)))
++        return ONLY_FOREGROUND ? float4(0) : vo.effective_background_premul;
++    if (!ONLY_BACKGROUND && any(vo.resize_scale > float2(1, 1))) {
++        float2 atlas = float2(crd.sprites_xnum, crd.sprites_ynum);
++        float2 shift = vo.resize_shift / atlas;
++        shift.y *= float(crd.cell_height) / float(crd.cell_height + 1);
++        float2 origin = floor(vo.sprite_pos.xy * atlas + .00001) / atlas;
++        vo.sprite_pos.xy = origin + (vo.sprite_pos.xy - origin) * vo.resize_scale - shift;
++        origin = floor(vo.underline_pos.xy * atlas + .00001) / atlas;
++        vo.underline_pos.xy = origin + (vo.underline_pos.xy - origin) * vo.resize_scale - shift;
++        origin = floor(vo.strike_pos.xy * atlas + .00001) / atlas;
++        vo.strike_pos.xy = origin + (vo.strike_pos.xy - origin) * vo.resize_scale - shift;
++        origin = floor(vo.cursor_pos.xy * atlas + .00001) / atlas;
++        vo.cursor_pos.xy = origin + (vo.cursor_pos.xy - origin) * vo.resize_scale - shift;
++    }
++    bool smooth_cursor = (own_slot < 0 || (crd.tui_window_size[own_slot].z == 0 && (crd.tui_cursor_reserved0 == 0 || float(own_slot + 1) == crd.tui_cursor_reserved0))) && crd.tui_cursor_alpha > 0.0 && vo.smooth_position.x >= crd.tui_cursor_left && vo.smooth_position.x < crd.tui_cursor_right &&
++        vo.smooth_position.y >= crd.tui_cursor_top && vo.smooth_position.y < crd.tui_cursor_bottom;
++    if (crd.tui_cursor_kind == 4.0) {
++        float dx = min(vo.smooth_position.x - crd.tui_cursor_left, crd.tui_cursor_right - vo.smooth_position.x);
++        float dy = min(vo.smooth_position.y - crd.tui_cursor_top, crd.tui_cursor_bottom - vo.smooth_position.y);
++        smooth_cursor = smooth_cursor && (dx < 1.0 / float(crd.cell_width) || dy < 1.0 / float(crd.cell_height));
++    }
+     float4 ans_premul = 0;
+     if (!ONLY_FOREGROUND) ans_premul = vo.effective_background_premul;
+ 
++    if (smooth_cursor && !ONLY_FOREGROUND) {
++        float4 cursor_bg = float4(crd.main_cursor_bg_lin.rgb * crd.tui_cursor_alpha, crd.tui_cursor_alpha);
++        ans_premul = alpha_blend_premul(cursor_bg, ans_premul);
++    }
++
+     if (!ONLY_BACKGROUND) {
+         // blend in the foreground color
+         float4 text_fg = load_text_foreground_color(vo.sprite_pos, vo.colored_sprite, vo.cell_foreground);
+         text_fg = adjust_foreground_contrast_with_background(text_fg, vo.background, text_contrast, text_gamma_adjustment);
++        float3 decoration_fg = vo.decoration_fg;
++        if (smooth_cursor) {
++            float3 cursor_fg = crd.tui_cursor_kind == 1.0 ? crd.main_cursor_fg_lin.rgb : crd.main_cursor_bg_lin.rgb;
++            text_fg.rgb = lerp(text_fg.rgb, cursor_fg, crd.tui_cursor_alpha);
++            decoration_fg = lerp(decoration_fg, cursor_fg, crd.tui_cursor_alpha);
++        }
+         float4 text_fg_premul = calculate_premul_foreground_from_sprites(
+             vo.sprite_pos,
+             vo.underline_pos,
+@@ -314,11 +485,15 @@ fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_g
+             vo.strike_pos,
+             vo.underline_exclusion_pos,
+             text_fg,
+-            vo.decoration_fg,
++            decoration_fg,
+             vo.cursor_color_premult,
+             vo.effective_text_alpha);
+         if (ONLY_FOREGROUND) ans_premul = text_fg_premul;
+         else ans_premul = alpha_blend_premul(text_fg_premul, ans_premul);
+     }
+-    return ans_premul;
++    float opacity = vo.smooth_reject;
++    // Keep the previous backdrop in the destination vacated by moving live
++    // cells. It disappears naturally as the moving pane reaches those pixels.
++    if (vo.smooth_active == 2.0 && !covered_by_window && in_destination) opacity = 1.0;
++    return ans_premul * opacity;
+ }
+diff --git a/kitty/vt-parser.c b/kitty/vt-parser.c
+index 382cd7683..48707c700 100644
+--- a/kitty/vt-parser.c
++++ b/kitty/vt-parser.c
+@@ -627,6 +627,135 @@ dispatch_osc(PS *self, uint8_t *buf, size_t limit, bool is_extended_osc) {
+         case 61: REPORT_ERROR("Ignoring OSC 60/61 used for query control in XTerm"); break;
+         case TEXT_SIZE_CODE: parse_multicell_code(self, buf + i, limit - i); break;
+         case DND_CODE: parse_dnd_code(self, buf + i, limit - i); break;
++        case 9912:
++            if (limit - i == 1 && buf[i] == '1') self->screen->tui_scroll.enabled = true;
++            else { screen_tui_scene_reset(self->screen); screen_tui_scroll_reset(self->screen); }
++            break;
++        case 9926: {
++            float strength, duration; char extra;
++            buf[limit] = 0;
++            if (self->screen->tui_scroll.enabled && limit - i < 64 &&
++                sscanf((char *)buf + i, "%f;%f%c", &strength, &duration, &extra) == 2 &&
++                isfinite(strength) && isfinite(duration) && strength >= 0.f && strength <= 3.f && duration >= .25f && duration <= 3.f) {
++                self->screen->tui_bounce_strength = strength;
++                self->screen->tui_bounce_duration = duration;
++                for (unsigned slot = 0; slot < TUI_WINDOW_SLOTS; slot++) {
++                    self->screen->tui_pane_scroll[slot].bounce_strength = strength;
++                    self->screen->tui_pane_scroll[slot].bounce_duration = duration;
++                }
++                self->screen->is_dirty = true;
++            }
++            break;
++        }
++        case 9918: screen_tui_layers_begin(self->screen); break;
++        case 9920: screen_tui_layers_commit(self->screen); break;
++        case 9922: screen_tui_layer_end(self->screen); break;
++        case 9924: {
++            unsigned owner;
++            buf[limit] = 0;
++            if (self->screen->tui_layers.inventory && limit - i < 32 && sscanf((char *)buf + i, "%u", &owner) == 1)
++                self->screen->tui_layers.pending_focused_owner_id = owner;
++            break;
++        }
++        case 9919:
++        case 9921: {
++            int id;
++            unsigned a, b, c, d, priority, border_mask = 0, buffer_id = 0;
++            buf[limit] = 0;
++            if (limit - i < 128 && sscanf((char *)buf + i, "%d;%u;%u;%u;%u;%u;%u;%u", &id, &a, &b, &c, &d, &priority, &border_mask, &buffer_id) >= 6) {
++                if (code == 9919) {
++                    screen_tui_layer_geometry(self->screen, (unsigned)id, a, b, c, d, priority);
++                    for (unsigned slot = 0; slot < TUI_WINDOW_SLOTS; slot++)
++                        if (self->screen->tui_scene.windows[slot].open_id == (unsigned)id) {
++                            self->screen->tui_scene.windows[slot].border_mask = border_mask & 15;
++                            TUIWindowMotion *w = &self->screen->tui_scene.windows[slot];
++                            if (w->buffer_id && buffer_id && w->buffer_id != buffer_id) {
++                                // Same pane, new buffer: animate only its new content.
++                                // Never retain the previous buffer's text as an overlay.
++                                w->open_y = .2f; w->open_x = 0.f;
++                                w->open_vx = w->open_vy = 0.f;
++                                w->open_at = monotonic(); w->quick_motion = true;
++                                self->screen->tui_scene.cursor_layout_changed = true;
++                            }
++                            w->buffer_id = buffer_id;
++                        }
++                }
++                else screen_tui_layer_select(self->screen, (unsigned)id, a, b, c, d, priority);
++            }
++            break;
++        }
++        case 9917: {
++            // Transient UI invalidates text snapshots, but does not cancel scrolling.
++            Py_CLEAR(self->screen->tui_scene.snapshot);
++            memset(self->screen->tui_scene.windows, 0, sizeof(self->screen->tui_scene.windows));
++            self->screen->tui_scene.started_at = 0;
++            self->screen->reload_all_gpu_data = self->screen->is_dirty = true;
++            break;
++        }
++        case 9916: {
++            if (self->screen->tui_scroll.enabled) {
++                char stats[128];
++                Screen *s = self->screen;
++                snprintf(stats, sizeof(stats), "9916;%u;%.1f;%.2f", s->tui_scene.frames,
++                    s->tui_scene.frame_sum > 0 ? s->tui_scene.frames / s->tui_scene.frame_sum : 0., 1000. * s->tui_scene.frame_max);
++                write_escape_code_to_child(s, ESC_OSC, stats);
++                s->tui_scene.frames = 0; s->tui_scene.frame_sum = s->tui_scene.frame_max = 0;
++                s->tui_scene.frame_at = 0;
++            }
++            break;
++        }
++        case 9915: {
++            unsigned top, bottom, left, right, id = 0, priority = 0;
++            float dx = 0, dy = .5f;
++            buf[limit] = 0;
++            if (limit - i < 128) {
++                int fields = sscanf((char *)buf + i, "%u;%u;%u;%u;%f;%f;%u;%u", &top, &bottom, &left, &right, &dx, &dy, &id, &priority);
++                if (fields == 4 || fields == 7 || fields == 8) screen_tui_window_update(self->screen, top, bottom, left, right, dx, dy, id, priority);
++            }
++            break;
++        }
++        case 9914: {
++            unsigned top, bottom, left, right;
++            buf[limit] = 0;
++            if (limit - i < 80 && sscanf((char *)buf + i, "%u;%u;%u;%u", &top, &bottom, &left, &right) == 4)
++                screen_tui_scene_capture(self->screen, top, bottom, left, right);
++            break;
++        }
++        case 9913: {
++            self->screen->tui_scene.cursor_initialized = false;
++            bool enabled = self->screen->tui_scroll.enabled;
++            // Focus changes invalidate the legacy flat viewport, never another
++            // native pane's independently owned scroll timeline.
++            Py_CLEAR(self->screen->tui_scroll.retained);
++            Py_CLEAR(self->screen->tui_scroll.scratch);
++            memset(&self->screen->tui_scroll, 0, sizeof(self->screen->tui_scroll));
++            self->screen->tui_scroll.enabled = enabled;
++            self->screen->reload_all_gpu_data = self->screen->is_dirty = true;
++            break;
++        }
++        case 9923: {
++            int owner, delta;
++            unsigned top, bottom, left, right;
++            buf[limit] = 0;
++            if (limit - i < 128 && sscanf((char *)buf + i, "%d;%u;%u;%u;%u;%d", &owner, &top, &bottom, &left, &right, &delta) == 6 && delta > -10000 && delta < 10000)
++                screen_tui_pane_scroll_update(self->screen, (unsigned)owner, top, bottom, left, right, delta);
++            break;
++        }
++        case 9911: {
++            unsigned top, bottom, left = 0, right = self->screen->columns;
++            int delta;
++            buf[limit] = 0;
++            if (limit - i < 80) {
++                int fields = sscanf((char *)buf + i, "%u;%u;%u;%u;%d", &top, &bottom, &left, &right, &delta);
++                if (fields != 5) {
++                    left = 0;
++                    right = self->screen->columns;
++                    fields = sscanf((char *)buf + i, "%u;%u;%d", &top, &bottom, &delta) == 3 ? 5 : 0;
++                }
++                if (fields == 5 && delta > -10000 && delta < 10000) screen_tui_scroll_update(self->screen, top, bottom, left, right, delta);
++            }
++            break;
++        }
+         case 133:
+ #ifdef DUMP_COMMANDS
+             START_DISPATCH
+diff --git a/kitty_tests/slang.py b/kitty_tests/slang.py
+index a76b2e8c4..1c575869e 100644
+--- a/kitty_tests/slang.py
++++ b/kitty_tests/slang.py
+@@ -36,6 +36,13 @@
+ 
+ 
+ class TestSlang(BaseTest):
++    def test_retained_grid_runtime_uniform_metadata(self):
++        from kitty.shaders.slang import load_glsl_metadata
++
++        uniforms = load_glsl_metadata()['cell']['loose_uniforms']
++        for name in ('tui_layer_mode', 'tui_layer_slot', 'tui_scroll_owner', 'instance_offset'):
++            self.assertIn(name, uniforms)
++
+     def test_animation_step_parsing(self):
+         def step(val):
+             return parse_pipeline_definition(['startgroup', f'animation_step {val}', 'shaders focus-highlight', 'endgroup'], 'test')['groups'][0][
+diff --git a/setup.py b/setup.py
+index 5fecc3014..bdaa213ed 100755
+--- a/setup.py
++++ b/setup.py
+@@ -640,6 +640,8 @@ def init_env(
+     env_cflags = shlex.split(os.environ.get('CFLAGS', ''))
+     env_cppflags = shlex.split(os.environ.get('CPPFLAGS', ''))
+     env_ldflags = shlex.split(os.environ.get('LDFLAGS', ''))
++    if is_macos and (develop_root := os.environ.get('DEVELOP_ROOT')):
++        env_ldflags += [f'-Wl,-rpath,{develop_root}', f'-Wl,-rpath,{develop_root}/lib']
+     # Newer clang does not use -fno-plt leading to an error
+     no_plt = '-fno-plt' if test_compile(cc, '-fno-plt', '-Werror') else ''
+ 
+@@ -1601,6 +1603,8 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
+         cflags.append(c_std)
+     cppflags = [define(f'WRAPPED_KITTENS=" {wrapped_kittens()} "')]
+     ldflags = shlex.split(os.environ.get('LDFLAGS', ''))
++    if is_macos and (develop_root := os.environ.get('DEVELOP_ROOT')):
++        ldflags += [f'-Wl,-rpath,{develop_root}', f'-Wl,-rpath,{develop_root}/lib']
+     xxhash = xxhash_flags()
+     cppflags.extend(xxhash[0])
+     libs: list[str] = xxhash[1]

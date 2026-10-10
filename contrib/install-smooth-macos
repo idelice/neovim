@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+installer_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+case "${1-}" in
+  --check|--uninstall|--help) exec python3 "$installer_root/contrib/smooth-installer/install.py" "$@" ;;
+esac
+if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
+  echo 'This installer supports native Apple Silicon macOS only.' >&2; exit 1
+fi
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo 'Install Apple Command Line Tools first: xcode-select --install' >&2; exit 1
+fi
+brew_bin=$(command -v brew || true)
+if [[ -z "$brew_bin" && -x /opt/homebrew/bin/brew ]]; then brew_bin=/opt/homebrew/bin/brew; fi
+if [[ -z "$brew_bin" ]]; then echo 'Install Homebrew first: https://brew.sh' >&2; exit 1; fi
+if [[ $("$brew_bin" --prefix) != /opt/homebrew ]]; then
+  echo 'Use native Apple Silicon Homebrew (/opt/homebrew), not Rosetta Homebrew.' >&2; exit 1
+fi
+"$brew_bin" install python cmake ninja gettext go pkgconf
+export PATH="$("$brew_bin" --prefix)/bin:$("$brew_bin" --prefix gettext)/bin:$PATH"
+exec "$("$brew_bin" --prefix)/bin/python3" "$installer_root/contrib/smooth-installer/install.py" "$@"

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Run the matching Neovim fork in this terminal; opening Kitty is explicit.
+set -eu
+nvim_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+kitty_root=$(dirname -- "$nvim_root")/kitty
+case "${1-}" in
+    --terminal)
+        shift
+        export NVIM_KITTY_SMOOTH_BIN="$nvim_root/contrib/bin"
+        export PATH="$NVIM_KITTY_SMOOTH_BIN:$PATH"
+        export SLANGC="${SLANGC:-/Applications/kitty.app/Contents/MacOS/slangc}"
+        exec "$kitty_root/kitty/launcher/kitty" -o cursor_trail=0 -o input_delay=1 -o sync_to_monitor=yes "$@"
+        ;;
+    --new-window)
+        shift
+        export VIMRUNTIME="$nvim_root/runtime"
+        export NVIM_KITTY_SMOOTH=1
+        export NVIM_KITTY_SMOOTH_LUA="$nvim_root/contrib/smooth-nvim.lua"
+        export SLANGC="${SLANGC:-/Applications/kitty.app/Contents/MacOS/slangc}"
+        exec "$kitty_root/kitty/launcher/kitty" -o cursor_trail=0 -o input_delay=1 -o sync_to_monitor=yes \
+            "$nvim_root/build-smooth/bin/nvim" -c 'lua dofile(vim.env.NVIM_KITTY_SMOOTH_LUA)' "$@"
+        ;;
+esac
+if [ "${KITTY_SMOOTH_NVIM-}" != 1 ]; then
+    printf '%s\n' 'Open the forked Kitty once with: ~/projects/neovim/contrib/smooth-nvim --terminal' >&2
+    exit 1
+fi
+export VIMRUNTIME="$nvim_root/runtime"
+export NVIM_KITTY_SMOOTH=1
+export NVIM_KITTY_SMOOTH_LUA="$nvim_root/contrib/smooth-nvim.lua"
+exec "$nvim_root/build-smooth/bin/nvim" -c 'lua dofile(vim.env.NVIM_KITTY_SMOOTH_LUA)' "$@"

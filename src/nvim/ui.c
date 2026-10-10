@@ -598,6 +598,7 @@ void ui_flush(void)
     (has_mouse ? ui_call_mouse_on : ui_call_mouse_off)();
     pending_has_mouse = has_mouse;
   }
+  ui_comp_kitty_frame();
   ui_call_flush();
 
   if (p_wd && (rdb_flags & kOptRdbFlagFlush)) {

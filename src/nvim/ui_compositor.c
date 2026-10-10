@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <uv.h>
 
@@ -16,6 +17,9 @@
 #include "nvim/ascii_defs.h"
 #include "nvim/buffer_defs.h"
 #include "nvim/globals.h"
+#include "nvim/garray.h"
+#include "nvim/mbyte.h"
+#include "nvim/strings.h"
 #include "nvim/grid.h"
 #include "nvim/highlight.h"
 #include "nvim/highlight_defs.h"
@@ -44,6 +48,9 @@ static int chk_width = 0, chk_height = 0;
 #endif
 
 static ScreenGrid *curgrid;
+// Cursor placement can target a non-current window (for example an external
+// command-line UI). Keep its source grid, rather than assuming curwin owns it.
+static int kitty_cursor_grid_handle;
 
 static bool valid_screen = true;
 static int msg_current_row = INT_MAX;
@@ -53,6 +60,282 @@ static int msg_sep_row = -1;
 static schar_T msg_sep_char = schar_from_ascii(' ');
 
 static int dbghl_normal, dbghl_clear, dbghl_composed, dbghl_recompose;
+
+// The terminal bridge exports the compositor's source grids, never a screenshot
+// of its already flattened output. Thus an overlapping float cannot become part
+// of another window's retained contents.
+static int kitty_grid_priority(ScreenGrid *grid)
+{
+  // The compositor already orders layers by z-index and insertion order.
+  // Export that dense rank rather than multiplying arbitrary user z-indices:
+  // valid high-z-index floats otherwise exceed the terminal's priority range.
+  return (int)MIN(grid->comp_index + 1, 1000000);
+}
+
+static int kitty_grid_identity(ScreenGrid *grid)
+{
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
+    if (grid == &wp->w_grid_alloc) {
+      return wp->handle;
+    }
+  }
+  return -grid->handle;
+}
+
+typedef struct {
+  int id;
+  uint64_t hash;
+  bool seen;
+} KittyGridVersion;
+static kvec_t(KittyGridVersion) kitty_grid_versions = KV_INITIAL_VALUE;
+static uint64_t kitty_previous_inventory_hash;
+static size_t kitty_previous_inventory_count;
+
+static uint64_t kitty_hash_bytes(uint64_t hash, const void *bytes, size_t len)
+{
+  const unsigned char *data = bytes;
+  for (size_t i = 0; i < len; i++) {
+    hash = (hash ^ data[i]) * UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static void kitty_grid_cell(ScreenGrid *grid, int row, int col, schar_T *text, int *attr)
+{
+  size_t offset = grid->line_offset[row] + (size_t)col;
+  *text = grid->chars[offset];
+  *attr = MAX(grid->attrs[offset], 0);
+  int screen_row = grid == &default_grid ? row : grid->comp_row + row;
+  int screen_col = grid == &default_grid ? col : grid->comp_col + col;
+  if (grid->blending && screen_row >= 0 && screen_row < default_grid.rows
+      && screen_col >= 0 && screen_col < default_grid.cols) {
+    size_t back = default_grid.line_offset[screen_row] + (size_t)screen_col;
+    bool through = (*text == schar_from_ascii(' ') || *text == schar_from_char(L'\u2800'))
+                   && default_grid.chars[back] != NUL;
+    *attr = hl_blend_attrs(default_grid.attrs[back], *attr, &through);
+    if (through) {
+      *text = default_grid.chars[back];
+    }
+  }
+}
+
+static void kitty_grid_export(garray_T *out, ScreenGrid *grid, int id, int top, int left,
+                             int priority)
+{
+  char escape[256];
+  int source_row = MAX(-top, 0);
+  int source_col = MAX(-left, 0);
+  int source_height = grid == &default_grid ? grid->rows : MIN(grid->rows, grid->comp_height);
+  int source_width = grid == &default_grid ? grid->cols : MIN(grid->cols, grid->comp_width);
+  int height = MIN(source_height - source_row, Rows - MAX(top, 0));
+  int width = MIN(source_width - source_col, Columns - MAX(left, 0));
+  top = MAX(top, 0);
+  left = MAX(left, 0);
+  if (!grid->chars || height <= 0 || width <= 0) {
+    return;
+  }
+  uint64_t hash = UINT64_C(14695981039346656037);
+  const int geometry[] = { top, left, width, height, priority };
+  hash = kitty_hash_bytes(hash, geometry, sizeof(geometry));
+  for (int row = 0; row < height; row++) {
+    for (int col = 0; col < width; col++) {
+      schar_T text;
+      int attr;
+      kitty_grid_cell(grid, row + source_row, col + source_col, &text, &attr);
+      HlAttrs hl = syn_attr2entry(attr);
+      hash = kitty_hash_bytes(hash, &text, sizeof(text));
+      hash = kitty_hash_bytes(hash, &hl, sizeof(hl));
+    }
+  }
+  KittyGridVersion *version = NULL;
+  for (size_t i = 0; i < kitty_grid_versions.size; i++) {
+    if (kitty_grid_versions.items[i].id == id) {
+      version = &kitty_grid_versions.items[i];
+      break;
+    }
+  }
+  if (version && version->hash == hash) {
+    version->seen = true;
+    return;
+  }
+  if (!version) {
+    kv_push(kitty_grid_versions, ((KittyGridVersion){ .id = id }));
+    version = &kv_last(kitty_grid_versions);
+  }
+  version->hash = hash;
+  version->seen = true;
+  int len = snprintf(escape, sizeof(escape), "\x1b]9921;%d;%d;%d;%d;%d;%d\x1b\\",
+                     id, top, left, width, height, priority);
+  ga_concat_len(out, escape, (size_t)len);
+  int previous_attr = -1;
+  for (int row = 0; row < height; row++) {
+    len = snprintf(escape, sizeof(escape), "\x1b[%d;%dH", top + row + 1, left + 1);
+    ga_concat_len(out, escape, (size_t)len);
+    for (int col = 0; col < width; col++) {
+      schar_T cell;
+      int attr;
+      kitty_grid_cell(grid, row + source_row, col + source_col, &cell, &attr);
+      if (attr != previous_attr) {
+        HlAttrs hl = syn_attr2entry(attr);
+        GA_CONCAT_LITERAL(out, "\x1b[0m");
+        int flags = hl.rgb_ae_attr;
+        if (flags & HL_BOLD) {
+          GA_CONCAT_LITERAL(out, "\x1b[1m");
+        }
+        if (flags & HL_DIM) {
+          GA_CONCAT_LITERAL(out, "\x1b[2m");
+        }
+        if (flags & HL_ITALIC) {
+          GA_CONCAT_LITERAL(out, "\x1b[3m");
+        }
+        if (flags & (HL_INVERSE | HL_STANDOUT)) {
+          GA_CONCAT_LITERAL(out, "\x1b[7m");
+        }
+        if (flags & HL_ALTFONT) {
+          GA_CONCAT_LITERAL(out, "\x1b[11m");
+        }
+        if (flags & HL_BLINK) {
+          GA_CONCAT_LITERAL(out, "\x1b[5m");
+        }
+        if (flags & HL_CONCEALED) {
+          GA_CONCAT_LITERAL(out, "\x1b[8m");
+        }
+        if (flags & HL_STRIKETHROUGH) {
+          GA_CONCAT_LITERAL(out, "\x1b[9m");
+        }
+        if (flags & HL_OVERLINE) {
+          GA_CONCAT_LITERAL(out, "\x1b[53m");
+        }
+        int underline = (flags & HL_UNDERLINE_MASK) >> 3;
+        if (underline) {
+          // Neovim and SGR underline style enumerations differ for curl/double.
+          const int styles[] = { 0, 1, 3, 2, 4, 5 };
+          len = snprintf(escape, sizeof(escape), "\x1b[4:%dm", styles[MIN(underline, 5)]);
+          ga_concat_len(out, escape, (size_t)len);
+        }
+        const int colors[] = { hl.rgb_fg_color, hl.rgb_bg_color, hl.rgb_sp_color };
+        const int codes[] = { 38, 48, 58 };
+        for (int i = 0; i < 3; i++) {
+          if (colors[i] >= 0) {
+            len = snprintf(escape, sizeof(escape), "\x1b[%d;2;%d;%d;%dm", codes[i],
+                           (colors[i] >> 16) & 255, (colors[i] >> 8) & 255, colors[i] & 255);
+            ga_concat_len(out, escape, (size_t)len);
+          }
+        }
+        previous_attr = attr;
+      }
+      char text[MAX_SCHAR_SIZE];
+      size_t textlen = schar_get(text, cell);
+      // Empty cells are the trailing half of a double-width glyph.
+      if (textlen) {
+        ga_concat_len(out, text, textlen);
+      } else if (col == 0) {
+        // A clipped leading half of a wide glyph still occupies a screen cell.
+        GA_CONCAT_LITERAL(out, " ");
+      }
+    }
+  }
+  GA_CONCAT_LITERAL(out, "\x1b]9922;\x1b\\");
+}
+
+/// Publish one complete native layout and its independent backing grids.
+/// The receiving terminal commits it at the synchronized-update boundary.
+void ui_comp_kitty_frame(void)
+{
+  if (getenv("NVIM_KITTY_SMOOTH") == NULL || curtab == NULL) {
+    return;
+  }
+  for (size_t i = 0; i < kitty_grid_versions.size; i++) {
+    kitty_grid_versions.items[i].seen = false;
+  }
+  garray_T out;
+  ga_init(&out, 1, 8192);
+  GA_CONCAT_LITERAL(&out, "\x1b]9918;\x1b\\");
+  char escape[256];
+  int cursor_owner = curwin->handle;
+  for (size_t i = 1; i < layers.size; i++) {
+    ScreenGrid *grid = layers.items[i];
+    if (!grid->comp_disabled && grid->handle == kitty_cursor_grid_handle) {
+      cursor_owner = kitty_grid_identity(grid);
+      break;
+    }
+  }
+  int focus_len = snprintf(escape, sizeof(escape), "\x1b]9924;%d\x1b\\", cursor_owner);
+  ga_concat_len(&out, escape, (size_t)focus_len);
+  size_t window_count = 0;
+  uint64_t inventory_hash = 0;
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
+    if (wp->w_config.hide || wp->w_config.external || wp->w_height_outer <= 0
+        || wp->w_width_outer <= 0) {
+      continue;
+    }
+    int top = MAX(wp->w_winrow, 0);
+    int bottom = MIN(wp->w_winrow + wp->w_height_outer, Rows);
+    int left = MAX(wp->w_wincol, 0);
+    int right = MIN(wp->w_wincol + wp->w_width_outer, Columns);
+    if (top >= bottom || left >= right) {
+      continue;
+    }
+    window_count++;
+    inventory_hash ^= kitty_hash_bytes(UINT64_C(14695981039346656037),
+                                       &wp->handle, sizeof(wp->handle));
+    int priority = wp->w_floating ? kitty_grid_priority(&wp->w_grid_alloc) : 0;
+    unsigned border_mask = 0;
+    if (wp->w_floating) {
+      if (wp->w_border_adj[0] && top == wp->w_winrow) { border_mask |= 1; }
+      if (wp->w_border_adj[1] && right == wp->w_wincol + wp->w_width_outer) { border_mask |= 2; }
+      if (wp->w_border_adj[2] && bottom == wp->w_winrow + wp->w_height_outer) { border_mask |= 4; }
+      if (wp->w_border_adj[3] && left == wp->w_wincol) { border_mask |= 8; }
+    }
+    int len = snprintf(escape, sizeof(escape), "\x1b]9919;%d;%d;%d;%d;%d;%d;%u;%d\x1b\\",
+                       wp->handle, top, bottom, left, right, priority, border_mask, wp->w_buffer->handle);
+    ga_concat_len(&out, escape, (size_t)len);
+  }
+  kitty_grid_export(&out, &default_grid, 1, 0, 0, 0);
+  for (size_t i = 1; i < layers.size; i++) {
+    ScreenGrid *grid = layers.items[i];
+    if (grid->comp_disabled) {
+      continue;
+    }
+    int id = kitty_grid_identity(grid);
+    int priority = kitty_grid_priority(grid);
+    if (id < 0) {
+      int top = MAX(grid->comp_row, 0);
+      int bottom = MIN(grid->comp_row + MIN(grid->rows, grid->comp_height), Rows);
+      int left = MAX(grid->comp_col, 0);
+      int right = MIN(grid->comp_col + MIN(grid->cols, grid->comp_width), Columns);
+      if (top >= bottom || left >= right) {
+        continue;
+      }
+      window_count++;
+      inventory_hash ^= kitty_hash_bytes(UINT64_C(14695981039346656037), &id, sizeof(id));
+      int len = snprintf(escape, sizeof(escape), "\x1b]9919;%d;%d;%d;%d;%d;%d\x1b\\",
+                         id, top, bottom, left, right, priority);
+      ga_concat_len(&out, escape, (size_t)len);
+    }
+    kitty_grid_export(&out, grid, id, grid->comp_row, grid->comp_col, priority);
+  }
+  GA_CONCAT_LITERAL(&out, "\x1b]9920;\x1b\\");
+  ui_call_ui_send((String){ .data = out.ga_data, .size = (size_t)out.ga_len });
+  ga_clear(&out);
+  if (window_count > 32 || inventory_hash != kitty_previous_inventory_hash
+      || window_count != kitty_previous_inventory_count) {
+    // Kitty may retain departing windows until the frame commits, temporarily
+    // exhausting its layer slots even when the new inventory fits. Repeat the
+    // backing surfaces once after any identity change so fallback can recover.
+    kitty_grid_versions.size = 0;
+  }
+  kitty_previous_inventory_hash = inventory_hash;
+  kitty_previous_inventory_count = window_count;
+  for (size_t i = 0; i < kitty_grid_versions.size;) {
+    if (!kitty_grid_versions.items[i].seen) {
+      kitty_grid_versions.items[i] = kv_last(kitty_grid_versions);
+      kitty_grid_versions.size--;
+    } else {
+      i++;
+    }
+  }
+}
 
 void ui_comp_init(void)
 {
@@ -64,6 +347,7 @@ void ui_comp_init(void)
 void ui_comp_free_all_mem(void)
 {
   kv_destroy(layers);
+  kv_destroy(kitty_grid_versions);
   xfree(linebuf);
   xfree(attrbuf);
 }
@@ -79,6 +363,10 @@ void ui_comp_syn_init(void)
 
 void ui_comp_attach(RemoteUI *ui)
 {
+  // A newly attached terminal has no retained backing surfaces.
+  kitty_grid_versions.size = 0;
+  kitty_previous_inventory_hash = 0;
+  kitty_previous_inventory_count = 0;
   composed_uis++;
   ui->composed = true;
 }
@@ -306,6 +594,7 @@ void ui_comp_grid_cursor_goto(Integer grid_handle, Integer r, Integer c)
     // abort();
     return;
   }
+  kitty_cursor_grid_handle = (int)grid_handle;
   ui_composed_call_grid_cursor_goto(1, cursor_row, cursor_col);
 }
 
@@ -678,6 +967,38 @@ static bool curgrid_covered_above(int top, int bot, int left, int right)
   return false;
 }
 
+// Emit source ownership before compositing. Covered and blended windows may
+// be redrawn as ordinary lines downstream, losing the original scroll event.
+static void kitty_source_scroll(ScreenGrid *grid, int top, int bottom, int left, int right,
+                                int delta)
+{
+  if (getenv("NVIM_KITTY_SMOOTH") == NULL || delta == 0) {
+    return;
+  }
+  top = MAX(top, 0);
+  bottom = MIN(bottom, Rows);
+  left = MAX(left, 0);
+  right = MIN(right, Columns);
+  if (top >= bottom || left >= right) {
+    return;
+  }
+  int owner = grid == &default_grid ? 1 : kitty_grid_identity(grid);
+  if (grid == &default_grid) {
+    FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
+      if (!wp->w_floating && !wp->w_config.hide
+          && top >= wp->w_winrow && bottom <= wp->w_winrow + wp->w_height_outer
+          && left >= wp->w_wincol && right <= wp->w_wincol + wp->w_width_outer) {
+        owner = wp->handle;
+        break;
+      }
+    }
+  }
+  char sequence[128];
+  int len = snprintf(sequence, sizeof(sequence), "\x1b]9923;%d;%d;%d;%d;%d;%d\x1b\\",
+                     owner, top, bottom, left, right, delta);
+  ui_call_ui_send((String){ .data = sequence, .size = (size_t)len });
+}
+
 void ui_comp_grid_scroll(Integer grid, Integer top, Integer bot, Integer left, Integer right,
                          Integer rows, Integer cols)
 {
@@ -688,6 +1009,7 @@ void ui_comp_grid_scroll(Integer grid, Integer top, Integer bot, Integer left, I
   bot += curgrid->comp_row;
   left += curgrid->comp_col;
   right += curgrid->comp_col;
+  kitty_source_scroll(curgrid, (int)top, (int)bot, (int)left, (int)right, (int)rows);
   bool covered = curgrid_covered_above((int)top, (int)bot, (int)left, (int)right);
 
   if (covered || curgrid->blending) {
