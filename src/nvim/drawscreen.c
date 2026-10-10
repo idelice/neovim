@@ -1394,7 +1394,16 @@ static void kitty_smooth_jump(win_T *wp)
   if (height <= 0 || width <= 0) {
     return;
   }
-  int delta = wp->w_topline > wp->w_lines[0].wl_lnum ? height : -height;
+  // Recenter/redraw fallbacks can move only a few screen rows. Treating
+  // every fallback as a whole viewport flashes unrelated departing content.
+  linenr_T previous_top = wp->w_lines[0].wl_lnum;
+  int distance = plines_m_win(wp, MIN(wp->w_topline, previous_top),
+                             MAX(wp->w_topline, previous_top) - 1, height);
+  distance = MIN(height, distance);
+  if (distance <= 0) {
+    return;
+  }
+  int delta = wp->w_topline > previous_top ? distance : -distance;
   row += grid->comp_row;
   col += grid->comp_col;
   int bottom = MIN(row + height, Rows);

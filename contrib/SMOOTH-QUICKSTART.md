@@ -45,7 +45,27 @@ Try it live without restarting:
 Live changes last for this session. Save the Lua config to keep them.
 Cursor bounce and trails remain disabled.
 
-## Update
+## Upgrade to latest stable Neovim + Kitty
+
+Run only when I want an upstream upgrade. Commit my local changes first.
+
+```sh
+./contrib/upgrade-smooth-macos
+```
+
+Uses stable tags only. Prepares separate checkouts; conflicts stop the upgrade
+and are printed in the terminal. My active installation stays in place on
+conflict or build failure. On success, reopen Kitty Smooth.
+
+If the new version has a visual regression:
+
+```sh
+./contrib/install-smooth-macos --rollback
+```
+
+Then reopen Kitty Smooth.
+
+## Update my fork’s published changes
 
 From my cloned Neovim repository:
 

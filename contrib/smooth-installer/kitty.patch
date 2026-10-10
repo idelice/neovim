@@ -127,10 +127,10 @@ index e2a4eae68..04100481b 100644
  
      if (!WD.screen->modes.mDECTCEM && ct->opacity <= 0.0f) { return true; }
 diff --git a/kitty/fast_data_types.pyi b/kitty/fast_data_types.pyi
-index 65a30b1bc..fcb0de954 100644
+index 65a30b1bc..afd225dc3 100644
 --- a/kitty/fast_data_types.pyi
 +++ b/kitty/fast_data_types.pyi
-@@ -1061,6 +1061,17 @@ class Cursor:
+@@ -1061,6 +1061,18 @@ class Cursor:
      shape: int
  
  class Screen:
@@ -139,6 +139,7 @@ index 65a30b1bc..fcb0de954 100644
 +
 +    tui_scene_snapshot: LineBuf | None
 +    tui_layers_active: bool
++    tui_layers_frozen: bool
 +    def test_tui_layer(self, layer_id: int) -> tuple[LineBuf, int, int, int, int, int] | None: ...
 +    def test_tui_window_sample(self, seconds: float, window_id: int = 0) -> tuple[float, float, float, float, int]: ...
 +    def test_tui_cursor(self, seconds: float, x: int, y: int) -> tuple[float, float, bool]: ...
@@ -149,10 +150,10 @@ index 65a30b1bc..fcb0de954 100644
      columns: int
      lines: int
 diff --git a/kitty/mouse.c b/kitty/mouse.c
-index 512b612db..ee1ee3397 100644
+index 512b612db..d9335421e 100644
 --- a/kitty/mouse.c
 +++ b/kitty/mouse.c
-@@ -1643,6 +1643,40 @@ scroll_event(const GLFWScrollEvent *ev) {
+@@ -1643,6 +1643,41 @@ scroll_event(const GLFWScrollEvent *ev) {
              osw->scroll.pending_pixels_y = 0.0;
              if (screen_apply_pixel_scroll(screen, delta_pixels) && screen->selections.in_progress) update_drag(w);
          } else {
@@ -162,6 +163,7 @@ index 512b612db..ee1ee3397 100644
 +                    w->mouse_pos.cell_y >= screen->tui_scroll.top && w->mouse_pos.cell_y < screen->tui_scroll.bottom)) &&
 +                ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES && OPT(touch_scroll_multiplier) != 0) {
 +                monotonic_t now = monotonic();
++                monotonic_t sample_at = screen_tui_sample_time(screen, now);
 +                double cell_height = global_state.callback_os_window->fonts_data->fcm.cell_height;
 +                double pixels = ev->y_offset * (OPT(touch_scroll_multiplier) < 0 ? -1. : 1.);
 +                TUIScrollContext *pane = NULL;
@@ -177,13 +179,13 @@ index 512b612db..ee1ee3397 100644
 +                }
 +                if (pane) {
 +                    float position, velocity;
-+                    screen_tui_pane_scroll_sample(pane, now, &position, &velocity);
++                    screen_tui_pane_scroll_sample(pane, sample_at, &position, &velocity);
 +                    float limit = (float)(pane->bottom - pane->top);
 +                    pane->offset = MAX(-limit, MIN(limit, position + (float)(pixels / cell_height)));
 +                    pane->velocity = 0.f; pane->last_input_at = now;
 +                    pane->started_at = now + ms_to_monotonic_t(80);
 +                }
-+                float offset = screen_tui_scroll_offset(screen, now) + (float)(pixels / cell_height);
++                float offset = screen_tui_scroll_offset(screen, sample_at) + (float)(pixels / cell_height);
 +                screen->tui_scroll.offset = MAX(-(float)screen->lines, MIN((float)screen->lines, offset));
 +                screen->tui_scroll.velocity = 0.f;
 +                screen->tui_scroll.last_input_at = now;
@@ -194,7 +196,7 @@ index 512b612db..ee1ee3397 100644
                  screen->modes.mouse_tracking_mode,
                  ev->y_offset,
 diff --git a/kitty/screen.c b/kitty/screen.c
-index f0af2419f..ca371bfe7 100644
+index f0af2419f..a56160604 100644
 --- a/kitty/screen.c
 +++ b/kitty/screen.c
 @@ -208,6 +208,8 @@ static Line *range_line_(Screen *self, int y);
@@ -217,12 +219,13 @@ index f0af2419f..ca371bfe7 100644
      screen_pause_rendering(self, false, 0);
      lines = MAX(1u, lines);
      columns = MAX(1u, columns);
-@@ -805,6 +811,15 @@ dealloc(Screen *self) {
+@@ -805,6 +811,16 @@ dealloc(Screen *self) {
      Py_CLEAR(self->overlay_line.overlay_text);
      PyMem_Free(self->main_tabstops);
      Py_CLEAR(self->paused_rendering.linebuf);
 +    Py_CLEAR(self->tui_scene.snapshot);
 +    Py_CLEAR(self->tui_layers.discard);
++    Py_CLEAR(self->tui_layers.frozen_legacy_retained);
 +    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
 +        Py_CLEAR(self->tui_layers.layers[i].current);
 +        Py_CLEAR(self->tui_layers.layers[i].pending);
@@ -233,12 +236,13 @@ index f0af2419f..ca371bfe7 100644
      Py_CLEAR(self->paused_rendering.grman);
      free(self->selections.items);
      free(self->url_ranges.items);
-@@ -1096,6 +1111,20 @@ screen_garbage_collect_text_cache(Screen *self) {
+@@ -1096,6 +1112,21 @@ screen_garbage_collect_text_cache(Screen *self) {
      text_cache_gc_process_linebuf(self->text_cache, gc, self->main_linebuf);
      text_cache_gc_process_linebuf(self->text_cache, gc, self->alt_linebuf);
      text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.linebuf);
 +    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_scene.snapshot);
 +    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.discard);
++    text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.frozen_legacy_retained);
 +    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
 +        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.layers[i].current);
 +        text_cache_gc_process_linebuf(self->text_cache, gc, self->tui_layers.layers[i].pending);
@@ -254,7 +258,7 @@ index f0af2419f..ca371bfe7 100644
      if (self->overlay_line.cpu_cells) text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.cpu_cells, self->overlay_line.xnum);
      if (self->overlay_line.original_line.cpu_cells)
          text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.original_line.cpu_cells, self->overlay_line.xnum);
-@@ -1956,6 +1985,8 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
+@@ -1956,6 +1987,8 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
  void
  screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_screen) {
      bool to_alt = self->linebuf == self->main_linebuf;
@@ -263,7 +267,7 @@ index f0af2419f..ca371bfe7 100644
      self->active_hyperlink_id = 0;
      reset_pixel_scroll(self, 0);
      if (to_alt) {
-@@ -3812,11 +3843,27 @@ copy_selections(Selections *dest, const Selections *src) {
+@@ -3812,11 +3845,28 @@ copy_selections(Selections *dest, const Selections *src) {
      return true;
  }
  
@@ -286,17 +290,22 @@ index f0af2419f..ca371bfe7 100644
 +        }
 +        self->tui_update_started_at = 0;
          self->paused_rendering.expires_at = 0;
++        Py_CLEAR(self->tui_layers.frozen_legacy_retained);
 +        if (self->tui_layers.pending_commit) screen_tui_layers_commit(self);
 +        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) screen_tui_pane_scroll_clear(&self->tui_frozen_scroll[i]);
          // ensure cell data is updated on GPU
          self->is_dirty = true;
          // ensure selection data is updated on GPU
-@@ -3834,7 +3881,40 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
+@@ -3834,7 +3884,51 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
      if (!self->paused_rendering.grman) self->paused_rendering.grman = grman_alloc(true);
      if (!self->paused_rendering.grman) return false;
      if (for_in_ms <= 0) for_in_ms = 2000;
 -    self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
-+    self->tui_layers.frozen = self->tui_layers.active && !self->reload_all_gpu_data;
++    const monotonic_t freeze_at = monotonic();
++    // A committed scene may not have reached the GPU before the next redraw.
++    // Preserve it even then, uploading its frozen backing once if necessary.
++    self->tui_layers.frozen = self->tui_layers.active;
++    self->tui_layers.frozen_needs_upload = self->reload_all_gpu_data || self->is_dirty;
 +    if (self->tui_layers.frozen) {
 +        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) screen_tui_pane_scroll_clear(&self->tui_frozen_scroll[i]);
 +        memcpy(self->tui_frozen_scroll, self->tui_pane_scroll, sizeof(self->tui_frozen_scroll));
@@ -311,7 +320,6 @@ index f0af2419f..ca371bfe7 100644
 +                } else { PyErr_Clear(); self->tui_layers.frozen = false; }
 +            }
 +        }
-+        monotonic_t freeze_at = monotonic();
 +        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
 +            TUIScrollContext *c = &self->tui_frozen_scroll[i];
 +            screen_tui_pane_scroll_sample(&self->tui_pane_scroll[i], freeze_at, &c->offset, &c->velocity);
@@ -319,21 +327,29 @@ index f0af2419f..ca371bfe7 100644
 +        }
 +        memcpy(self->tui_layers.frozen_windows, self->tui_scene.windows, sizeof(self->tui_layers.frozen_windows));
 +        self->tui_layers.frozen_retained_rows = screen_tui_retained_rows(self);
-+        self->tui_layers.frozen_scroll_offset = screen_tui_scroll_offset(self, monotonic());
++        Py_CLEAR(self->tui_layers.frozen_legacy_retained);
++        if (self->tui_layers.frozen_retained_rows) {
++            LineBuf *src = self->tui_scroll.retained;
++            LineBuf *copy = self->tui_layers.frozen_legacy_retained = alloc_linebuf(src->ynum, src->xnum, self->text_cache);
++            if (copy) for (unsigned y = 0; y < src->ynum; y++) {
++                linebuf_init_line(src, y); linebuf_copy_line_to(copy, src->line, y);
++            } else { PyErr_Clear(); self->tui_layers.frozen = false; }
++        }
++        self->tui_layers.frozen_scroll_offset = screen_tui_scroll_offset(self, freeze_at);
 +        self->tui_layers.frozen_scroll_rect[0] = self->tui_scroll.top;
 +        self->tui_layers.frozen_scroll_rect[1] = self->tui_scroll.bottom;
 +        self->tui_layers.frozen_scroll_rect[2] = self->tui_scroll.left;
 +        self->tui_layers.frozen_scroll_rect[3] = self->tui_scroll.right;
 +        self->tui_layers.frozen_owner_id = self->tui_scroll.owner_id;
-+        if (self->tui_scene.cursor_moving) screen_tui_cursor_sample(self, monotonic(), &self->tui_layers.frozen_cursor_x, &self->tui_layers.frozen_cursor_y);
++        if (self->tui_scene.cursor_moving) screen_tui_cursor_sample(self, freeze_at, &self->tui_layers.frozen_cursor_x, &self->tui_layers.frozen_cursor_y);
 +        else { self->tui_layers.frozen_cursor_x = self->cursor_render_info.x; self->tui_layers.frozen_cursor_y = self->cursor_render_info.y; }
 +    }
-+    self->tui_update_started_at = monotonic();
++    self->tui_update_started_at = freeze_at;
 +    self->paused_rendering.expires_at = self->tui_update_started_at + ms_to_monotonic_t(for_in_ms);
      self->paused_rendering.inverted = self->modes.mDECSCNM;
      self->paused_rendering.scrolled_by = self->scrolled_by;
      self->paused_rendering.cell_data_updated = false;
-@@ -3933,6 +4013,606 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
+@@ -3933,6 +4027,611 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
  }
  
  
@@ -341,6 +357,7 @@ index f0af2419f..ca371bfe7 100644
 +screen_tui_scene_reset(Screen *s) {
 +    screen_tui_layer_end(s);
 +    Py_CLEAR(s->tui_layers.discard);
++    Py_CLEAR(s->tui_layers.frozen_legacy_retained);
 +    for (unsigned i = 0; i <= TUI_WINDOW_SLOTS; i++) {
 +        Py_CLEAR(s->tui_layers.layers[i].current);
 +        Py_CLEAR(s->tui_layers.layers[i].pending);
@@ -550,7 +567,9 @@ index f0af2419f..ca371bfe7 100644
 +    s->tui_layers.inventory = s->tui_layers.pending_commit = false;
 +    content_changed = content_changed || s->tui_scene.snapshot != NULL;
 +    Py_CLEAR(s->tui_scene.snapshot);
-+    s->reload_all_gpu_data = s->reload_all_gpu_data || content_changed;
++    // New backing rows already carry dirty text. Re-rasterizing every unchanged
++    // retained row on each highlight/status redraw adds startup scroll latency.
++    if (content_changed) s->is_dirty = true;
 +    s->is_dirty = true;
 +}
 +
@@ -759,7 +778,9 @@ index f0af2419f..ca371bfe7 100644
 +    if (!same) screen_tui_pane_scroll_clear(c);
 +    c->bounce_strength = s->tui_bounce_strength; c->bounce_duration = s->tui_bounce_duration;
 +    c->owner_id = owner; c->top = top; c->bottom = bottom; c->left = left; c->right = right;
-+    monotonic_t now = monotonic();
++    // A synchronized redraw holds the displayed frame at this time. Retarget
++    // from that same instant, not from an unseen advanced spring position.
++    monotonic_t now = screen_tui_sample_time(s, monotonic());
 +    float position, velocity;
 +    screen_tui_pane_scroll_sample(c, now, &position, &velocity);
 +    LineBuf *source = s->tui_layers.layers[TUI_WINDOW_SLOTS].current;
@@ -860,7 +881,7 @@ index f0af2419f..ca371bfe7 100644
 +            }
 +        }
 +    }
-+    monotonic_t now = monotonic();
++    monotonic_t now = screen_tui_sample_time(self, monotonic());
 +    float position = 0.f, velocity = 0.f;
 +    bool same_region = self->tui_scroll.owner_id == owner_id && self->tui_scroll.top == top && self->tui_scroll.bottom == bottom && self->tui_scroll.left == left && self->tui_scroll.right == right;
 +    bool touchpad = self->tui_scroll.last_input_at && now - self->tui_scroll.last_input_at < ms_to_monotonic_t(220);
@@ -940,7 +961,17 @@ index f0af2419f..ca371bfe7 100644
  static void
  update_line_data(Line *line, unsigned int dest_y, uint8_t *data) {
      size_t base = sizeof(GPUCell) * dest_y * line->xnum;
-@@ -4128,7 +4808,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+@@ -4119,7 +4818,8 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+                 update_line_data(linebuf->line, y, address);
+             }
+         }
+-        return;
++        if (!self->tui_layers.frozen) return;
++        goto retained_cell_data;
+     }
+     const bool is_overlay_active = screen_is_overlay_active(self);
+     unsigned int history_line_added_count = self->history_line_added_count;
+@@ -4128,7 +4828,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
      const bool force_history_render = pixel_scroll_enabled(self) && self->scroll_changed;
      if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_added_count, self->historybuf->count);
      self->scroll_changed = false;
@@ -949,10 +980,11 @@ index f0af2419f..ca371bfe7 100644
      const int render_row_offset = pixel_scroll_enabled(self);
      Line line = {.text_cache = self->text_cache};
      for (unsigned int render_row = 0; render_row < render_lines; render_row++) {
-@@ -4160,6 +4840,64 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+@@ -4160,6 +4860,66 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
          }
          update_line_data(linep, render_row, address);
      }
++retained_cell_data:
 +    if (screen_tui_scene_rows(self)) {
 +        LineBuf *lb = self->tui_scene.snapshot;
 +        unsigned base = self->lines + screen_tui_retained_rows(self);
@@ -967,7 +999,7 @@ index f0af2419f..ca371bfe7 100644
 +    }
 +    unsigned retained_rows = screen_tui_retained_rows(self);
 +    if (retained_rows) {
-+        LineBuf *lb = self->tui_scroll.retained;
++        LineBuf *lb = self->paused_rendering.expires_at ? self->tui_layers.frozen_legacy_retained : self->tui_scroll.retained;
 +        for (unsigned y = 0; y < retained_rows; y++) {
 +            linebuf_init_line(lb, y);
 +            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
@@ -999,7 +1031,7 @@ index f0af2419f..ca371bfe7 100644
 +    }
 +    unsigned pane_base = self->lines + screen_tui_retained_rows(self) + screen_tui_scene_rows(self) + screen_tui_layer_rows(self);
 +    for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
-+        LineBuf *lb = self->tui_pane_scroll[i].retained;
++        LineBuf *lb = screen_tui_render_scroll(self, i)->retained;
 +        if (!lb || lb->xnum != self->columns || lb->ynum != 2 * self->lines) continue;
 +        for (unsigned y = 0; y < 2 * self->lines; y++) {
 +            linebuf_init_line(lb, y);
@@ -1011,10 +1043,11 @@ index f0af2419f..ca371bfe7 100644
 +        }
 +        pane_base += 2 * self->lines;
 +    }
++    if (self->paused_rendering.expires_at) return;
      if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
          if (self->overlay_line.is_dirty) {
              linebuf_init_line(self->linebuf, self->overlay_line.ynum);
-@@ -7187,7 +7925,78 @@ test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
+@@ -7187,7 +7947,78 @@ test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
      return Py_BuildValue("kkk", is_idx, idx, ca);
  }
  
@@ -1093,7 +1126,7 @@ index f0af2419f..ca371bfe7 100644
      METHODB(test_create_write_buffer, METH_NOARGS),
      METHODB(test_commit_write_buffer, METH_VARARGS),
      METHODB(test_parse_written_data, METH_VARARGS),
-@@ -7226,7 +8035,24 @@ static PyMethodDef methods[] = {
+@@ -7226,7 +8057,24 @@ static PyMethodDef methods[] = {
      {NULL} /* Sentinel */
  };
  
@@ -1118,18 +1151,19 @@ index f0af2419f..ca371bfe7 100644
      GETSET(in_bracketed_paste_mode) GETSET(color_preference_notification) GETSET(auto_repeat_enabled) GETSET(focus_tracking_enabled)
          GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(cursor_visible) GETSET(cursor_key_mode) GETSET(disable_ligatures)
              GETSET(render_unfocused_cursor){NULL} /* Sentinel */
-@@ -7252,6 +8078,9 @@ static PyMemberDef members[] = {
+@@ -7252,6 +8100,10 @@ static PyMemberDef members[] = {
      {"main_linebuf", T_OBJECT_EX, offsetof(Screen, main_linebuf), READONLY, "main_linebuf"},
      {"historybuf", T_OBJECT_EX, offsetof(Screen, historybuf), READONLY, "historybuf"},
      {"scrolled_by", T_UINT, offsetof(Screen, scrolled_by), READONLY, "scrolled_by"},
 +    {"tui_layers_active", T_BOOL, offsetof(Screen, tui_layers.active), READONLY, "Native retained grid composition enabled"},
 +    {"tui_scene_snapshot", T_OBJECT, offsetof(Screen, tui_scene.snapshot), READONLY, "Retained transition scene"},
++    {"tui_layers_frozen", T_BOOL, offsetof(Screen, tui_layers.frozen), READONLY, "Frozen native scene during synchronized redraw"},
 +    {"tui_scroll_cache", T_OBJECT, offsetof(Screen, tui_scroll.retained), READONLY, "Retained prototype rows"},
      {"pixel_scroll_offset_y", T_UINT, offsetof(Screen, pixel_scroll_offset_y), READONLY, "pixel_scroll_offset_y"},
      {"lines", T_UINT, offsetof(Screen, lines), READONLY, "lines"},
      {"columns", T_UINT, offsetof(Screen, columns), READONLY, "columns"},
 diff --git a/kitty/screen.h b/kitty/screen.h
-index 262503380..147fd858f 100644
+index 262503380..17f4e6621 100644
 --- a/kitty/screen.h
 +++ b/kitty/screen.h
 @@ -11,6 +11,7 @@
@@ -1195,12 +1229,12 @@ index 262503380..147fd858f 100644
 +    } tui_scene;
 +    struct {
 +        TUIRetainedLayer layers[TUI_WINDOW_SLOTS + 1];
-+        bool inventory, pending_commit, active, overflow, frozen;
++        bool inventory, pending_commit, active, overflow, frozen, frozen_needs_upload;
 +        unsigned focused_owner_id, pending_focused_owner_id;
 +        TUIWindowMotion frozen_windows[TUI_WINDOW_SLOTS];
 +        unsigned frozen_retained_rows, frozen_scroll_rect[4], frozen_owner_id;
 +        float frozen_scroll_offset, frozen_cursor_x, frozen_cursor_y;
-+        LineBuf *discard;
++        LineBuf *discard, *frozen_legacy_retained;
 +        LineBuf *saved_linebuf;
 +        Cursor saved_cursor;
 +    } tui_layers;
@@ -1209,7 +1243,7 @@ index 262503380..147fd858f 100644
      CellPixelSize cell_size;
      OverlayLine overlay_line;
      id_type window_id;
-@@ -229,8 +287,110 @@ typedef struct {
+@@ -229,8 +287,116 @@ typedef struct {
      } dnd_chunking;
  } Screen;
  
@@ -1236,6 +1270,12 @@ index 262503380..147fd858f 100644
 +        }
 +    }
 +    *velocity /= duration;
++}
++
++// Input may arrive while a synchronized redraw holds the visible frame.
++static inline monotonic_t
++screen_tui_sample_time(const Screen *s, monotonic_t now) {
++    return s->paused_rendering.expires_at ? s->tui_update_started_at : now;
 +}
 +
 +// Analytic bounded settling. Retargeting samples position and velocity,
@@ -1322,7 +1362,7 @@ index 262503380..147fd858f 100644
  void screen_align(Screen *);
  void screen_garbage_collect_text_cache(Screen *screen);
 diff --git a/kitty/shaders.c b/kitty/shaders.c
-index 5cb7cf637..5ded3aabf 100644
+index 5cb7cf637..fcaddf962 100644
 --- a/kitty/shaders.c
 +++ b/kitty/shaders.c
 @@ -924,6 +924,7 @@ cell_update_uniform_block(
@@ -1470,7 +1510,7 @@ index 5cb7cf637..5ded3aabf 100644
  
      if (screen->paused_rendering.expires_at) {
 -        if (!screen->paused_rendering.cell_data_updated) update_cell_data;
-+        if (!screen->paused_rendering.cell_data_updated && !screen->tui_layers.frozen) update_cell_data;
++        if (!screen->paused_rendering.cell_data_updated && (!screen->tui_layers.frozen || screen->tui_layers.frozen_needs_upload)) update_cell_data;
      } else if (screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || (disable_ligatures && cursor_pos_changed))
          update_cell_data;
  

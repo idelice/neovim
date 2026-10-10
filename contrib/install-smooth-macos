@@ -2,7 +2,7 @@
 set -euo pipefail
 installer_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 case "${1-}" in
-  --check|--uninstall|--help) exec python3 "$installer_root/contrib/smooth-installer/install.py" "$@" ;;
+  --check|--uninstall|--rollback|--help) exec python3 "$installer_root/contrib/smooth-installer/install.py" "$@" ;;
 esac
 if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   echo 'This installer supports native Apple Silicon macOS only.' >&2; exit 1

@@ -263,14 +263,45 @@ def uninstall(args):
     print(f'Deactivated. Stock installations are unchanged. Builds/backups retained in {prefix}.')
 
 
+
+def rollback(args):
+    prefix = args.prefix
+    if not (prefix / '.kitty-smooth-install').is_file():
+        raise RuntimeError('No managed installation at this prefix.')
+    lock = prefix / '.install-lock'
+    lock.mkdir()
+    try:
+        saved = prefix / 'previous-target'
+        current = prefix / 'current'
+        if not saved.exists() or not current.is_symlink():
+            raise RuntimeError('No previous installation to restore.')
+        target = Path(saved.read_text()).resolve()
+        if target.parent != (prefix / 'releases').resolve() or not (target / 'bin/nvim').is_file():
+            raise RuntimeError('Previous installation is missing or invalid.')
+        old = current.resolve()
+        link = prefix / 'rollback-next'
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+        link.replace(current)
+        saved.write_text(str(old))
+        print('Restored previous build. Close Kitty Smooth windows and reopen the app.')
+    finally:
+        lock.rmdir()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--rollback', action='store_true', help='Restore the previous successful build')
     parser.add_argument('--check', action='store_true', help='Validate checkout and patch without installing')
     parser.add_argument('--uninstall', action='store_true', help='Remove app/shell wiring; keep builds and backups')
     parser.add_argument('--prefix', type=Path, default=Path.home() / '.local/share/kitty-smooth')
     parser.add_argument('--app-dir', type=Path, default=Path.home() / 'Applications')
     args = parser.parse_args()
     args.prefix, args.app_dir = args.prefix.expanduser().resolve(), args.app_dir.expanduser().resolve()
+    if args.rollback:
+        rollback(args)
+        return
     if args.uninstall:
         uninstall(args)
         return

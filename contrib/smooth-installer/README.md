@@ -59,6 +59,41 @@ Try changes live with:
 This controls scrolling and pane/content settling. Cursor bounce and trails stay
 disabled. The live command applies to this session; edit config to persist it.
 
+## Upgrade upstream versions only when wanted
+
+Commit local Neovim changes first, then run:
+
+```sh
+./contrib/upgrade-smooth-macos
+```
+
+The script selects the highest numeric stable tag from the official Neovim and
+Kitty repositories, excluding nightly/prerelease tags. It transplants our custom
+changes onto those exact tag commits in isolated checkouts, rather than merging
+upstream master. This matters when our original base is newer than stable.
+
+Conflicts stop before any build/install, print the affected files, and leave the
+original checkout and active installation untouched. Prepared/conflicted sources
+are retained under `~/.local/share/kitty-smooth-upgrades` for investigation. Nothing
+is pushed. Commit custom changes before retrying; the script refuses dirty sources.
+
+When both patches apply, the installer builds and smoke-tests both forks before
+activation. Build failures retain the active version. Reopen Kitty Smooth after
+success. Subsequent runs reuse the last successfully adapted source when the
+original checkout has not changed. Keep the upgrades directory for that purpose.
+If the original checkout changes, its committed changes are used instead.
+
+A clean patch/build does not guarantee identical visual behavior. If manual
+use exposes a regression, restore the previous build:
+
+```sh
+./contrib/install-smooth-macos --rollback
+```
+
+Close old Kitty Smooth windows and reopen. Rollback switches the managed build;
+it does not change your original repository or config. To prepare sources without
+building or activating anything, use `./contrib/upgrade-smooth-macos --prepare-only`.
+
 ## Check, update, and uninstall
 
 Validate the checkout and patch without installing:
@@ -85,11 +120,13 @@ packages and stock applications are never removed. Backups are under
 ## Maintainer: refresh the Kitty snapshot
 
 The manifest pins Kitty's base commit and checksums `kitty.patch`. The patch
-includes the tested working-tree changes, so a separate Kitty branch does not
-have to be published. Before publishing new Kitty changes, run:
+includes committed and tracked working-tree changes relative to the recorded
+upstream base, so a separate Kitty branch does not have to be published. Before publishing new Kitty changes, run:
 
 ```sh
 python3 contrib/smooth-installer/refresh-kitty-patch.py ../kitty
+# After deliberately changing the upstream base:
+# python3 contrib/smooth-installer/refresh-kitty-patch.py ../kitty --base vX.Y.Z
 ```
 
 Publish the Neovim source changes, Lua bridge, installer, manifest, and patch
