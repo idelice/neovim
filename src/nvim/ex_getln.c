@@ -226,8 +226,8 @@ static void set_search_match(pos_T *t)
 {
   // First move cursor to end of match, then to the start.  This
   // moves the whole match onto the screen when 'nowrap' is set.
-  t->lnum += Search.match_lines;
-  t->col = Search.match_endcol;
+  t->lnum += search_match_lines;
+  t->col = search_match_endcol;
   if (t->lnum > curbuf->b_ml.ml_line_count) {
     t->lnum = curbuf->b_ml.ml_line_count;
     coladvance(curwin, MAXCOL);

@@ -1318,21 +1318,21 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
                && wp == curwin
                && !has_foldtext
                && lnum >= curwin->w_cursor.lnum
-               && lnum <= curwin->w_cursor.lnum + Search.match_lines) {
+               && lnum <= curwin->w_cursor.lnum + search_match_lines) {
       if (lnum == curwin->w_cursor.lnum) {
         getvcol(curwin, &(curwin->w_cursor), &wlv.fromcol, NULL, NULL, 0);
       } else {
         wlv.fromcol = 0;
       }
-      if (lnum == curwin->w_cursor.lnum + Search.match_lines) {
+      if (lnum == curwin->w_cursor.lnum + search_match_lines) {
         pos_T pos = {
           .lnum = lnum,
-          .col = Search.match_endcol,
+          .col = search_match_endcol,
         };
         getvcol(curwin, &pos, &wlv.tocol, NULL, NULL, 0);
       }
       // do at least one character; happens when past end of line
-      if (wlv.fromcol == wlv.tocol && Search.match_endcol) {
+      if (wlv.fromcol == wlv.tocol && search_match_endcol) {
         wlv.tocol = wlv.fromcol + 1;
       }
       area_highlighting = true;

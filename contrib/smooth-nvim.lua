@@ -13,6 +13,27 @@ local function apply_bounce()
   vim.api.nvim_ui_send(('\27]9926;%g;%g\27\\'):format(strength, duration))
 end
 apply_bounce()
+local function apply_scroll()
+  local length = vim.g.kitty_smooth_scroll_length or 0.10
+  if type(length) ~= 'number' or length ~= length or length < 0.025 or length > 1 then
+    error('kitty_smooth_scroll_length must be 0.025..1 seconds')
+  end
+  vim.api.nvim_ui_send(('\27]9927;%g\27\\'):format(length))
+end
+apply_scroll()
+vim.api.nvim_create_user_command('SmoothScroll', function(args)
+  local previous = vim.g.kitty_smooth_scroll_length
+  local length = tonumber(args.args)
+  if not length then error('Usage: SmoothScroll <seconds 0.025..1>') end
+  vim.g.kitty_smooth_scroll_length = length
+  local ok, err = pcall(apply_scroll)
+  if not ok then vim.g.kitty_smooth_scroll_length = previous; error(err) end
+end, { nargs = 1, desc = 'Adjust native scroll response time in seconds' })
+vim.api.nvim_create_user_command('SmoothCursor', function(args)
+  if args.args ~= 'on' and args.args ~= 'off' then error('Usage: SmoothCursor on|off') end
+  vim.api.nvim_ui_send(('\27]9928;%d\27\\'):format(args.args == 'off' and 1 or 0))
+end, { nargs = 1, complete = function() return { 'on', 'off' } end,
+  desc = 'Show or hide cursor drawing for scroll diagnosis' })
 vim.api.nvim_create_user_command('SmoothBounce', function(args)
   if #args.fargs ~= 2 then error('Usage: SmoothBounce <strength 0..3> <duration 0.25..3>') end
   local strength, duration = tonumber(args.fargs[1]), tonumber(args.fargs[2])
@@ -42,6 +63,7 @@ vim.api.nvim_create_autocmd('User', {
   pattern = 'VeryLazy',
   callback = function()
     apply_bounce()
+    apply_scroll()
     vim.g.snacks_scroll = false
     local loaded = package.loaded['snacks.scroll']
     if loaded then loaded.disable() end
@@ -53,13 +75,10 @@ vim.api.nvim_create_autocmd('User', {
     end
   end,
 })
-vim.api.nvim_create_autocmd({ 'BufEnter', 'WinEnter', 'TabEnter', 'InsertEnter', 'TextChanged', 'CmdlineEnter' }, {
-  group = group,
-  callback = function()
-    -- Drop old-buffer rows and finish coasting before editing or changing focus.
-    vim.api.nvim_ui_send('\27]9913;\27\\')
-  end,
-})
+-- Native frames carry buffer and focused-window identity. Let their committed
+-- inventory invalidate departed content and retarget the cursor. Resetting from
+-- Lua autocmds happens before that commit and snaps the cursor on every edit,
+-- mode transition, and window change (including temporary plugin windows).
 
 -- Native Ctrl-D/U, j/k, counts, folds, and mappings remain intact. Kitty now
 -- retains the departing rows and animates the full native viewport update.

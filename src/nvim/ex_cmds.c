@@ -4009,11 +4009,11 @@ static int do_sub(exarg_T *eap, proftime_T tm, const int cmdpreview_ns,
               ml_replace(lnum, new_line.data, false);
             }
 
-            Search.match_lines = regmatch.endpos[0].lnum - regmatch.startpos[0].lnum;
-            Search.match_endcol = regmatch.endpos[0].col + len_change;
-            if (Search.match_lines == 0 && Search.match_endcol == 0) {
+            search_match_lines = regmatch.endpos[0].lnum - regmatch.startpos[0].lnum;
+            search_match_endcol = regmatch.endpos[0].col + len_change;
+            if (search_match_lines == 0 && search_match_endcol == 0) {
               // highlight at least one character for /^/
-              Search.match_endcol = 1;
+              search_match_endcol = 1;
             }
             Search.hl_match = true;
 

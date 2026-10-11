@@ -137,14 +137,18 @@ static void kitty_grid_export(garray_T *out, ScreenGrid *grid, int id, int top, 
   uint64_t hash = UINT64_C(14695981039346656037);
   const int geometry[] = { top, left, width, height, priority };
   hash = kitty_hash_bytes(hash, geometry, sizeof(geometry));
+  // Highlight entries are interned and immutable until the table is reset.
+  // Comparing IDs avoids hashing a full HlAttrs for every unchanged cell on
+  // progress/status redraws. The generation prevents reused IDs hiding changes.
+  uint64_t attr_generation = hl_get_attr_generation();
+  hash = kitty_hash_bytes(hash, &attr_generation, sizeof(attr_generation));
   for (int row = 0; row < height; row++) {
     for (int col = 0; col < width; col++) {
       schar_T text;
       int attr;
       kitty_grid_cell(grid, row + source_row, col + source_col, &text, &attr);
-      HlAttrs hl = syn_attr2entry(attr);
       hash = kitty_hash_bytes(hash, &text, sizeof(text));
-      hash = kitty_hash_bytes(hash, &hl, sizeof(hl));
+      hash = kitty_hash_bytes(hash, &attr, sizeof(attr));
     }
   }
   KittyGridVersion *version = NULL;

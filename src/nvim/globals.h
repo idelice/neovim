@@ -326,6 +326,11 @@ EXTERN int include_link INIT( = 0);     // when 2 include "link" and "clear"
 /// Per-subsystem state for the search/highlight engine; see search_defs.h.
 EXTERN SearchState Search INIT( = { .last_line = MAXLNUM });
 
+// Keep these exported globals for plugins that use the search engine through FFI.
+// They remain the authoritative state, including writes made by those plugins.
+EXTERN linenr_T search_match_lines INIT( = 0);
+EXTERN colnr_T search_match_endcol INIT( = 0);
+
 EXTERN bool need_check_timestamps INIT( = false);  // need to check file
                                                    // timestamps asap
 EXTERN bool did_check_timestamps INIT( = false);   // did check timestamps

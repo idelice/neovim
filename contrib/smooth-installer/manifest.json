@@ -1,6 +1,6 @@
 {
   "kitty_url": "https://github.com/idelice/kitty.git",
   "kitty_base": "fb68ed81e0ca81dd6f6e040f2e60472d28d69cb1",
-  "kitty_patch_sha256": "1f772bb758a7faef3771b59ade2b036c9f822f48c316b36806c9108ea95703e0",
+  "kitty_patch_sha256": "710ff7824918218b0ba97a7486a0242f5a6043e63ea15e31211dfaebe821f155",
   "neovim_base": "402a494f47808442f3de9266b147b274f8c7a5be"
 }

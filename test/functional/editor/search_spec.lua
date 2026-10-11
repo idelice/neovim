@@ -12,6 +12,20 @@ local pcall_err = t.pcall_err
 describe('search (/)', function()
   before_each(clear)
 
+  it('exports writable match positions for FFI search consumers', function()
+    eq({ 1, 3, 7, 2 }, n.exec_lua([[
+      local ffi = require('ffi')
+      ffi.cdef('extern int32_t search_match_lines; extern int search_match_endcol;')
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'abc', 'def' })
+      vim.fn.searchpos('bc\\ndef', 'cW')
+      local lines, col = tonumber(ffi.C.search_match_lines), tonumber(ffi.C.search_match_endcol)
+      ffi.C.search_match_lines, ffi.C.search_match_endcol = 7, 2
+      -- searchcount must preserve state written by an FFI caller.
+      vim.fn.searchcount({ pattern = 'a', recompute = 1 })
+      return { lines, col, tonumber(ffi.C.search_match_lines), tonumber(ffi.C.search_match_endcol) }
+    ]]))
+  end)
+
   it('fails with huge column (%c) value #9930', function()
     eq([[Vim:E951: \% value too large]], pcall_err(command, '/\\v%18446744071562067968c'))
     eq([[Vim:E951: \% value too large]], pcall_err(command, '/\\v%2147483648c'))

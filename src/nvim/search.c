@@ -359,14 +359,14 @@ void restore_last_search_pattern(void)
 /// incsearch highlighting.
 static void save_incsearch_state(void)
 {
-  saved_search_match_endcol = Search.match_endcol;
-  saved_search_match_lines = Search.match_lines;
+  saved_search_match_endcol = search_match_endcol;
+  saved_search_match_lines = search_match_lines;
 }
 
 static void restore_incsearch_state(void)
 {
-  Search.match_endcol = saved_search_match_endcol;
-  Search.match_lines = saved_search_match_lines;
+  search_match_endcol = saved_search_match_endcol;
+  search_match_lines = saved_search_match_lines;
 }
 
 char *last_search_pattern(void)
@@ -900,8 +900,8 @@ int searchit(win_T *win, buf_T *buf, pos_T *pos, pos_T *end_pos, Direction dir, 
           first_match = false;
 
           // Set variables used for 'incsearch' highlighting.
-          Search.match_lines = endpos.lnum - matchpos.lnum;
-          Search.match_endcol = endpos.col;
+          search_match_lines = endpos.lnum - matchpos.lnum;
+          search_match_endcol = endpos.col;
           break;
         }
         line_breakcheck();              // stop if ctrl-C typed

@@ -37,6 +37,7 @@
 static bool hlstate_active = false;
 
 static Set(HlEntry) attr_entries = SET_INIT;
+static uint64_t attr_generation;
 static Map(uint64_t, int) combine_attr_entries = MAP_INIT;
 static Map(uint64_t, int) blend_attr_entries = MAP_INIT;
 static Map(uint64_t, int) blendthrough_attr_entries = MAP_INIT;
@@ -578,6 +579,7 @@ int hl_get_term_attr(HlAttrs *aep)
 /// Clear all highlight tables.
 void clear_hl_tables(bool reinit)
 {
+  attr_generation++;
   const char *url = NULL;
   set_foreach(&urls, url, {
     xfree((void *)url);
@@ -918,7 +920,13 @@ static int hl_cterm2rgb_color(int nr)
   return (r << 16) + (g << 8) + b;
 }
 
-/// Get highlight attributes for a attribute code
+/// Generation of interned highlight IDs; changes when IDs may be reused.
+uint64_t hl_get_attr_generation(void)
+{
+  return attr_generation;
+}
+
+/// Get highlight attributes for an attribute code.
 HlAttrs syn_attr2entry(int attr)
 {
   if (attr <= 0 || attr >= (int)set_size(&attr_entries)) {

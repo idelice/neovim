@@ -57,6 +57,7 @@ while time.monotonic()<end:
  if p.poll() is not None:break
 p.wait(timeout=2);os.close(m)
 assert p.returncode==0,data[-2500:]
+assert b'\x1b]9913;' not in data, 'Window/buffer/mode changes reset cursor animation before the native frame commits'
 Path('/tmp/native-grid-stream.bin').write_bytes(data)
 assert b'\x1b]9921;' in data,'No native retained grid layers'
 assert b'FLOAT_A_REPLACED' in data and b'FLOAT_B_TOP' in data

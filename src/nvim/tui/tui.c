@@ -1699,6 +1699,14 @@ void tui_ui_send(TUIData *tui, String content)
       || os_getenv("NVIM_KITTY_SMOOTH") != NULL) {
     // Append to buffer instead of writing directly.
     out(tui, content.data, content.size);
+    if (os_getenv("NVIM_KITTY_SMOOTH") != NULL
+        && content.size >= sizeof("\x1b]9920;\x1b\\") - 1
+        && memcmp(content.data + content.size - (sizeof("\x1b]9920;\x1b\\") - 1),
+                  "\x1b]9920;\x1b\\", sizeof("\x1b]9920;\x1b\\") - 1) == 0) {
+      // Commit cursor appearance with the retained scene, even if a transient
+      // terminal-style reset occurred without a Neovim mode change.
+      tui_set_mode(tui, tui->showing_mode);
+    }
     return;
   }
   uv_write_t req;

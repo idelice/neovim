@@ -21,6 +21,10 @@ with tempfile.TemporaryDirectory(prefix='smooth-centering-') as directory:
 local lines = {}
 for i=1,500 do lines[i] = ('line %04d'):format(i) end
 vim.api.nvim_buf_set_lines(0,0,-1,false,lines)
+local ns=vim.api.nvim_create_namespace('smooth-highlight-cache')
+vim.api.nvim_buf_set_extmark(0,ns,0,0,{end_row=500,hl_group='SmoothChurn'})
+local ffi=require('ffi')
+ffi.cdef('void clear_hl_tables(_Bool reinit);')
 vim.wo.wrap=false
 vim.wo.scrolloff=0
 vim.cmd('normal! 100G')
@@ -45,8 +49,12 @@ local function tick()
   vim.cmd('redraw')
   expected[#expected+1]=('%d %d'):format(step,after-before)
   -- Mimic asynchronous startup highlighting between navigation redraws.
+  vim.api.nvim_ui_send(('\27]9930;COLOR_BEGIN;%d\27\\'):format(step))
+  if step==6 then ffi.C.clear_hl_tables(true) end
+  vim.api.nvim_set_hl(0,'SmoothChurn',{fg=step%2==0 and '#112233' or '#445566'})
   vim.api.nvim_set_hl(0,'Normal',{fg=step%2==0 and '#dddddd' or '#eeeeee'})
   vim.cmd('redraw')
+  vim.api.nvim_ui_send(('\27]9930;COLOR_END;%d\27\\'):format(step))
   vim.defer_fn(tick,20)
 end
 vim.defer_fn(tick,80)
@@ -57,7 +65,8 @@ vim.defer_fn(tick,80)
                NVIM_LOG_FILE=str(directory / 'nvim.log'))
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH',30,100,0,0))
-    process = subprocess.Popen([str(root / 'build-smooth/bin/nvim'), '-u','NONE','-n','-i','NONE',
+    nvim = os.environ.get('NVIM_PRG', str(root / 'build-smooth/bin/nvim'))
+    process = subprocess.Popen([nvim, '-u','NONE','-n','-i','NONE',
         '-c', f'luafile {script}'], stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True)
     os.close(slave)
     output = b''
@@ -83,7 +92,11 @@ vim.defer_fn(tick,80)
             assert frame, (step,output[-1000:])
             deltas = re.findall(rb'\x1b\]9923;[^\x1b]*;(-?\d+)\x1b\\',frame[1])
             assert sum(map(int,deltas)) == delta, (step,delta,deltas)
+            colors = re.search(rb'\x1b\]9930;COLOR_BEGIN;'+str(step).encode()+rb'\x1b\\(.*?)\x1b\]9930;COLOR_END;'+str(step).encode()+rb'\x1b\\',output,re.S)
+            expected_color = b'\x1b[38;2;17;34;51m' if step%2==0 else b'\x1b[38;2;68;85;102m'
+            assert colors and expected_color in colors[1], ('Stale native highlight cache', step)
         print('PASS: 12 repeated zz frames preserve exact viewport displacement during startup highlight churn')
+        print('PASS: native highlight colors refresh after ID changes and highlight-table reset')
     finally:
         if process.poll() is None:
             os.killpg(process.pid,signal.SIGTERM)
