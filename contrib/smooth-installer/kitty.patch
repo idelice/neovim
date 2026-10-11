@@ -30,11 +30,230 @@ index 0b17d9bd0..d281404c1 100644
  	}
  	cmd = append(cmd, path)
  	c := exec.Command("install_name_tool", cmd...)
+diff --git a/glfw/cocoa_displaylink.m b/glfw/cocoa_displaylink.m
+index 81512706d..eece2eaea 100644
+--- a/glfw/cocoa_displaylink.m
++++ b/glfw/cocoa_displaylink.m
+@@ -20,6 +20,11 @@
+     CGDirectDisplayID displayID;
+     monotonic_t lastRenderFrameRequestedAt, first_unserviced_render_frame_request_at;
+     bool pending_dispatch;
++    // Temporary diagnostics; all shared fields are protected by the entry lock.
++    monotonic_t previous_callback_at, queued_callback_at, dispatched_at;
++    double callback_host_seconds, output_host_seconds, refresh_period, rate_scalar, callback_gap, expected_at;
++    unsigned long long callback_count, dispatch_count, start_count, stop_count, recreate_count;
++
+ } _GLFWDisplayLinkNS;
+ 
+ static struct {
+@@ -55,6 +60,7 @@
+         os_unfair_lock *lock = &displayLinks.locks[i];
+         os_unfair_lock_lock(lock);
+         CVDisplayLinkRef link = entry->displayLink;
++        if (link && CVDisplayLinkIsRunning(link)) entry->stop_count++;
+         entry->displayLink = NULL;
+         entry->displayID = (CGDirectDisplayID)0;
+         entry->lastRenderFrameRequestedAt = 0;
+@@ -74,8 +80,8 @@
+ static CVReturn
+ displayLinkCallback(
+     CVDisplayLinkRef displayLink UNUSED,
+-    const CVTimeStamp *now UNUSED,
+-    const CVTimeStamp *outputTime UNUSED,
++    const CVTimeStamp *now,
++    const CVTimeStamp *outputTime,
+     CVOptionFlags flagsIn UNUSED,
+     CVOptionFlags *flagsOut UNUSED,
+     void *userInfo) {
+@@ -83,7 +89,22 @@
+     if (entry) {
+         os_unfair_lock *lock = lock_for_entry(entry);
+         os_unfair_lock_lock(lock);
++        const monotonic_t callback_at = glfwGetTime();
++        double gap = entry->previous_callback_at ? monotonic_t_to_s_double(callback_at - entry->previous_callback_at) : 0.;
++        entry->previous_callback_at = callback_at;
++        entry->callback_count++;
+         const bool should_dispatch = entry->first_unserviced_render_frame_request_at && !entry->pending_dispatch;
++        if (should_dispatch) {
++            entry->queued_callback_at = callback_at;
++            double frequency = CVGetHostClockFrequency();
++            const uint64_t host_current = CVGetCurrentHostTime();
++            entry->callback_host_seconds = (now->flags & kCVTimeStampHostTimeValid) && frequency > 0. ? now->hostTime / frequency : 0.;
++            entry->output_host_seconds = (outputTime->flags & kCVTimeStampHostTimeValid) && frequency > 0. ? outputTime->hostTime / frequency : 0.;
++            entry->refresh_period = (outputTime->flags & kCVTimeStampVideoRefreshPeriodValid) && outputTime->videoTimeScale > 0 ? (double)outputTime->videoRefreshPeriod / outputTime->videoTimeScale : 0.;
++            entry->rate_scalar = (outputTime->flags & kCVTimeStampRateScalarValid) ? outputTime->rateScalar : 0.;
++            entry->callback_gap = gap;
++            entry->expected_at = entry->output_host_seconds > 0. && frequency > 0. ? monotonic_t_to_s_double(callback_at) + (entry->output_host_seconds - host_current / frequency) : 0.;
++        }
+         CGDirectDisplayID displayID = entry->displayID;
+         if (should_dispatch) entry->pending_dispatch = true;
+         os_unfair_lock_unlock(lock);
+@@ -137,6 +158,7 @@
+         os_unfair_lock *lock = &displayLinks.locks[i];
+         os_unfair_lock_lock(lock);
+         CVDisplayLinkRef link = dl->displayLink;
++        if (link && CVDisplayLinkIsRunning(link)) dl->stop_count++;
+         if (link) CVDisplayLinkRetain(link);
+         dl->lastRenderFrameRequestedAt = 0;
+         dl->first_unserviced_render_frame_request_at = 0;
+@@ -182,15 +204,18 @@
+             if (link) {
+                 if (!CVDisplayLinkIsRunning(link)) {
+                     need_start = true;
++                    dl->start_count++;
+                     retain_link = true;
+                 } else if (now - first_unserviced > s_to_monotonic_t(1ll)) {
+                     need_recreate = true;
++                    dl->recreate_count++; dl->stop_count++;
+                     dl->first_unserviced_render_frame_request_at = now;
+                     dl->displayLink = NULL;
+                 }
+             }
+         } else if (link && dl->lastRenderFrameRequestedAt && now - dl->lastRenderFrameRequestedAt >= DISPLAY_LINK_SHUTDOWN_CHECK_INTERVAL) {
+             need_stop = true;
++            dl->stop_count++;
+             retain_link = true;
+             dl->lastRenderFrameRequestedAt = 0;
+             dl->first_unserviced_render_frame_request_at = 0;
+@@ -211,7 +236,10 @@
+             dl->pending_dispatch = false;
+             os_unfair_lock_unlock(lock);
+             if (new_link) {
+-                if (!CVDisplayLinkIsRunning(new_link)) CVDisplayLinkStart(new_link);
++                if (!CVDisplayLinkIsRunning(new_link)) {
++                    os_unfair_lock_lock(lock); dl->start_count++; os_unfair_lock_unlock(lock);
++                    CVDisplayLinkStart(new_link);
++                }
+                 if (new_link_retained) CVDisplayLinkRelease(new_link);
+             }
+             _glfwInputError(GLFW_PLATFORM_ERROR, "CVDisplayLink stuck possibly because of sleep/screensaver + Apple's incompetence, recreating.");
+@@ -234,7 +262,10 @@
+             if (link) CVDisplayLinkRetain(link);
+             os_unfair_lock_unlock(lock);
+             if (link) {
+-                if (!CVDisplayLinkIsRunning(link)) CVDisplayLinkStart(link);
++                if (!CVDisplayLinkIsRunning(link)) {
++                    os_unfair_lock_lock(lock); dl->start_count++; os_unfair_lock_unlock(lock);
++                    CVDisplayLinkStart(link);
++                }
+                 CVDisplayLinkRelease(link);
+             }
+         }
+@@ -244,6 +275,15 @@
+ static void
+ _glfwDispatchRenderFrame(void *passed_in_data) {
+     CGDirectDisplayID displayID = (uintptr_t)passed_in_data;
++    for (size_t i = 0; i < displayLinks.count; i++) {
++        os_unfair_lock *lock = &displayLinks.locks[i];
++        os_unfair_lock_lock(lock);
++        if (displayLinks.entries[i].displayID == displayID) {
++            displayLinks.entries[i].dispatched_at = glfwGetTime();
++            displayLinks.entries[i].dispatch_count++;
++        }
++        os_unfair_lock_unlock(lock);
++    }
+     _GLFWwindow *w = _glfw.windowListHead;
+     while (w) {
+         if (w->ns.renderFrameRequested && displayID == displayIDForWindow(w)) {
+@@ -252,35 +292,58 @@
+         }
+         w = w->next;
+     }
++    // The callback only schedules the terminal's main-loop draw. It does not
++    // request the next frame until after drawing/swapping, so no pending request
++    // here does not mean animation is idle. Stopping at this point restarts the
++    // display link on every frame and discards its stable refresh phase.
++    // Keep it running; callback dispatch is gated on pending requests and the
++    // existing idle shutdown timer stops links after rendering becomes idle.
+     for (size_t i = 0; i < displayLinks.count; i++) {
+         _GLFWDisplayLinkNS *dl = &displayLinks.entries[i];
+-        bool need_stop = false;
+-        CVDisplayLinkRef link = NULL;
+         os_unfair_lock *lock = &displayLinks.locks[i];
+         os_unfair_lock_lock(lock);
+         if (dl->displayID == displayID) {
+             dl->first_unserviced_render_frame_request_at = 0;
+             dl->pending_dispatch = false;
+-            bool any_pending_request = false;
+             _GLFWwindow *window = _glfw.windowListHead;
+             while (window) {
+                 if (window->ns.renderFrameRequested && displayID == displayIDForWindow(window)) {
+-                    any_pending_request = true;
++                    dl->first_unserviced_render_frame_request_at = dl->lastRenderFrameRequestedAt;
+                     break;
+                 }
+                 window = window->next;
+             }
+-            link = dl->displayLink;
+-            if (!any_pending_request && link && CVDisplayLinkIsRunning(link)) {
+-                need_stop = true;
+-                CVDisplayLinkRetain(link);
+-                dl->lastRenderFrameRequestedAt = 0;
+-            }
+         }
+         os_unfair_lock_unlock(lock);
+-        if (need_stop && link) {
+-            CVDisplayLinkStop(link);
+-            CVDisplayLinkRelease(link);
+-        }
+     }
+ }
++
++// Copy a coherent display-clock snapshot on the main thread. No logging or
++// file I/O runs on the CoreVideo callback thread.
++GLFWAPI int
++glfwCocoaGetRenderFrameTiming(GLFWwindow *handle, double *values, unsigned long long *counts) {
++    CGDirectDisplayID displayID = displayIDForWindow((_GLFWwindow *)handle);
++    for (size_t i = 0; i < displayLinks.count; i++) {
++        os_unfair_lock *lock = &displayLinks.locks[i];
++        os_unfair_lock_lock(lock);
++        _GLFWDisplayLinkNS *dl = &displayLinks.entries[i];
++        if (dl->displayID != displayID) { os_unfair_lock_unlock(lock); continue; }
++        values[0] = dl->displayID;
++        values[1] = monotonic_t_to_s_double(dl->lastRenderFrameRequestedAt);
++        values[2] = monotonic_t_to_s_double(dl->queued_callback_at);
++        values[3] = monotonic_t_to_s_double(dl->dispatched_at);
++        values[4] = dl->callback_host_seconds;
++        values[5] = dl->output_host_seconds;
++        values[6] = dl->refresh_period;
++        values[7] = dl->rate_scalar;
++        values[8] = dl->callback_gap;
++        values[9] = dl->output_host_seconds - dl->callback_host_seconds;
++        values[10] = monotonic_t_to_s_double(dl->dispatched_at - dl->queued_callback_at);
++        values[11] = dl->expected_at;
++        counts[0] = dl->callback_count; counts[1] = dl->dispatch_count;
++        counts[2] = dl->start_count; counts[3] = dl->stop_count; counts[4] = dl->recreate_count;
++        os_unfair_lock_unlock(lock);
++        return 1;
++    }
++    return 0;
++}
+diff --git a/glfw/glfw.py b/glfw/glfw.py
+index db2c8c7ac..440bfd8da 100755
+--- a/glfw/glfw.py
++++ b/glfw/glfw.py
+@@ -87,6 +87,7 @@ def generate_wrappers(glfw_header: str) -> None:
+     GLFWapplicationwillfinishlaunchingfun glfwSetApplicationWillFinishLaunching(GLFWapplicationwillfinishlaunchingfun callback)
+     uint32_t glfwGetCocoaKeyEquivalent(uint32_t glfw_key, int glfw_mods, int* cocoa_mods)
+     void glfwCocoaRequestRenderFrame(GLFWwindow *w, GLFWcocoarenderframefun callback)
++    int glfwCocoaGetRenderFrameTiming(GLFWwindow *w, double *values, unsigned long long *counts)
+     bool glfwCocoaRecreateGLDrawable(GLFWwindow *w)
+     GLFWcocoarenderframefun glfwCocoaSetWindowResizeCallback(GLFWwindow *w, GLFWcocoarenderframefun callback)
+     void* glfwGetX11Display(void)
 diff --git a/kitty/child-monitor.c b/kitty/child-monitor.c
-index 483e53cb8..23c1df7c7 100644
+index 483e53cb8..1d54e12fe 100644
 --- a/kitty/child-monitor.c
 +++ b/kitty/child-monitor.c
-@@ -938,6 +938,28 @@ prepare_to_render_os_window(
+@@ -11,6 +11,8 @@
+ #include "threading.h"
+ #include "screen.h"
+ #include "monotonic.h"
++#include "glfw-wrapper.h"
++#include "gl.h"
+ #include <termios.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+@@ -938,6 +940,28 @@ prepare_to_render_os_window(
                      set_maximum_wait(min_gap);
                  }
              }
@@ -63,7 +282,118 @@ index 483e53cb8..23c1df7c7 100644
              if (send_cell_data_to_gpu(WD.vao_idx, WD.screen, os_window)) needs_render = true;
              if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) needs_render = true;
              if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) needs_render = true;
-@@ -1130,12 +1152,37 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
+@@ -1028,6 +1052,68 @@ thumbnail_callback(OSWindow *os_window) {
+ #undef tc
+ }
+ 
++// Temporary GPU backlog gauge. Zero-timeout fence polls never wait for the
++// GPU. Completion is bracketed by CPU observations, not a presentation time.
++typedef struct { id_type window; GLsync sync; monotonic_t submitted, last_pending; unsigned long long sequence; } TUITraceGPUFence;
++static struct {
++    GLsync (*insert)(GLenum, GLbitfield);
++    GLenum (*poll)(GLsync, GLbitfield, GLuint64);
++    void (*destroy)(GLsync);
++    bool initialized;
++    unsigned long long sequence;
++    TUITraceGPUFence slots[128];
++} tui_gpu_trace;
++
++static void
++trace_gpu_backlog(OSWindow *w, bool submit) {
++    if (!screen_tui_trace_enabled()) return;
++    if (!tui_gpu_trace.initialized) {
++        tui_gpu_trace.initialized = true;
++        tui_gpu_trace.insert = (GLsync (*)(GLenum, GLbitfield))glfwGetProcAddress("glFenceSync");
++        tui_gpu_trace.poll = (GLenum (*)(GLsync, GLbitfield, GLuint64))glfwGetProcAddress("glClientWaitSync");
++        tui_gpu_trace.destroy = (void (*)(GLsync))glfwGetProcAddress("glDeleteSync");
++        screen_tui_trace("{\"event\":\"gpu_trace_capability\",\"time\":%.9f,\"available\":%s,\"build\":\"%s %s\"}\n",
++            monotonic_t_to_s_double(monotonic()), tui_gpu_trace.insert && tui_gpu_trace.poll && tui_gpu_trace.destroy ? "true" : "false", __DATE__, __TIME__);
++    }
++    if (!tui_gpu_trace.insert || !tui_gpu_trace.poll || !tui_gpu_trace.destroy) return;
++    monotonic_t now = monotonic();
++    unsigned pending = 0;
++    int free_slot = -1;
++    for (unsigned i = 0; i < arraysz(tui_gpu_trace.slots); i++) {
++        TUITraceGPUFence *f = tui_gpu_trace.slots + i;
++        if (!f->sync) { if (free_slot < 0) free_slot = i; continue; }
++        if (f->window != w->id) continue;
++        if (!submit) {
++            // GL_ALREADY_SIGNALED / GL_CONDITION_SATISFIED / GL_WAIT_FAILED.
++            GLenum result = tui_gpu_trace.poll(f->sync, 0, 0);
++            if (result == 0x911A || result == 0x911C || result == 0x911D) {
++                screen_tui_trace("{\"event\":\"gpu_fence\",\"time\":%.9f,\"os_window\":%llu,\"sequence\":%llu,\"submitted_at\":%.9f,\"last_pending_at\":%.9f,\"wait_failed\":%s}\n",
++                    monotonic_t_to_s_double(now), (unsigned long long)w->id, f->sequence,
++                    monotonic_t_to_s_double(f->submitted), monotonic_t_to_s_double(f->last_pending), result == 0x911D ? "true" : "false");
++                tui_gpu_trace.destroy(f->sync); f->sync = NULL;
++                if (free_slot < 0) free_slot = i;
++                continue;
++            }
++            f->last_pending = now;
++        }
++        pending++;
++    }
++    if (submit) {
++        if (pending >= 8 || free_slot < 0) {
++            screen_tui_trace("{\"event\":\"gpu_backlog\",\"time\":%.9f,\"os_window\":%llu,\"pending\":%u}\n",
++                monotonic_t_to_s_double(now), (unsigned long long)w->id, pending);
++            return;
++        }
++        TUITraceGPUFence *f = tui_gpu_trace.slots + free_slot;
++        // GL_SYNC_GPU_COMMANDS_COMPLETE. Swap flushes the fence naturally.
++        f->sync = tui_gpu_trace.insert(0x9117, 0);
++        f->window = w->id; f->submitted = f->last_pending = now; f->sequence = ++tui_gpu_trace.sequence;
++    }
++    screen_tui_trace("{\"event\":\"gpu_probe\",\"time\":%.9f,\"os_window\":%llu,\"submit\":%s,\"pending\":%u,\"duration_ms\":%.6f}\n",
++        monotonic_t_to_s_double(now), (unsigned long long)w->id, submit ? "true" : "false", pending,
++        1000. * monotonic_t_to_s_double(monotonic() - now));
++}
++
+ static void
+ render_prepared_os_window(
+     OSWindow *os_window,
+@@ -1036,6 +1122,10 @@ render_prepared_os_window(
+     unsigned int num_visible_windows,
+     bool all_windows_have_same_bg,
+     monotonic_t now) {
++    const bool trace = screen_tui_trace_enabled();
++    const monotonic_t draw_started_at = trace ? monotonic() : 0;
++    const monotonic_t frame_received_at = trace ? os_window->last_render_frame_received_at : 0;
++    if (trace) trace_gpu_backlog(os_window, false);
+     Tab *tab = os_window->tabs + os_window->active_tab;
+     setup_os_window_for_rendering(os_window, tab, NULL, true, now);
+     BorderRects *br = &tab->border_rects;
+@@ -1066,7 +1156,18 @@ render_prepared_os_window(
+         thumbnail_callback(os_window);
+         global_state.thumbnail_callback.os_window = 0;
+     }
++    if (trace) trace_gpu_backlog(os_window, true);
++    const monotonic_t before_swap = trace ? monotonic() : 0;
+     swap_window_buffers(os_window);
++    if (trace) {
++        const monotonic_t after_swap = monotonic();
++        // CPU draw/swap boundaries are not display presentation timestamps.
++        screen_tui_trace("{\"event\":\"pipeline\",\"os_window\":%llu,\"start_draw\":%.9f,\"before_swap\":%.9f,\"after_swap\":%.9f,\"last_render_frame_received_at\":%.9f,\"use_render_frames\":%s,\"viewport_width\":%u,\"viewport_height\":%u}\n",
++            (unsigned long long)os_window->id, monotonic_t_to_s_double(draw_started_at),
++            monotonic_t_to_s_double(before_swap), monotonic_t_to_s_double(after_swap),
++            monotonic_t_to_s_double(frame_received_at), USE_RENDER_FRAMES ? "true" : "false",
++            os_window->viewport_width, os_window->viewport_height);
++    }
+     os_window->last_active_tab = os_window->active_tab;
+     os_window->last_num_tabs = os_window->num_tabs;
+     os_window->last_active_window_id = active_window_id;
+@@ -1121,21 +1222,49 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
+         log_error("No fonts data found for window id: %llu", w->id);
+         return false;
+     }
++    const monotonic_t prepare_at = screen_tui_trace_enabled() ? monotonic() : 0;
+     if (prepare_to_render_os_window(w, now, &active_window_id, &active_window_bg, &num_visible_windows, &all_windows_have_same_bg, scan_for_animated_images))
+         needs_render = true;
+     if (w->last_active_window_id != active_window_id || w->last_active_tab != w->active_tab || w->focused_at_last_render != w->is_focused) needs_render = true;
+     if (w->render_calls < 3 && background_image_for_os_window(w) != NULL) needs_render = true;
++    if (prepare_at) screen_tui_trace("{\"event\":\"window_prepare\",\"time\":%.9f,\"os_window\":%llu,\"began_at\":%.9f,\"needs_render\":%s,\"layers\":%s,\"render_state\":%d}\n",
++        monotonic_t_to_s_double(monotonic()), (unsigned long long)w->id, monotonic_t_to_s_double(prepare_at), needs_render ? "true" : "false", w->needs_layers ? "true" : "false", (int)w->render_state);
+     if (needs_render) render_prepared_os_window(w, active_window_id, active_window_bg, num_visible_windows, all_windows_have_same_bg, now);
+     if (w->is_focused) change_menubar_title(w->window_title);
      return needs_render;
  }
  
@@ -102,6 +432,27 @@ index 483e53cb8..23c1df7c7 100644
          set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
          return;
      }
+@@ -1566,12 +1695,20 @@ process_global_state(void *data) {
+     bool input_read = false;
+ 
+     monotonic_t now = monotonic();
++    const monotonic_t loop_at = screen_tui_trace_enabled() ? now : 0;
+     if (global_state.has_pending_resizes) {
+         process_pending_resizes(now);
+         input_read = true;
+     }
++    const monotonic_t parse_at = loop_at ? monotonic() : 0;
+     if (parse_input(self)) input_read = true;
++    const monotonic_t parsed_at = loop_at ? monotonic() : 0;
++    // Parsing may commit new animation targets at a later timestamp. Render
++    // from the current clock rather than a time preceding those commits.
++    now = monotonic();
+     render(now, input_read);
++    if (loop_at) screen_tui_trace("{\"event\":\"mainloop\",\"time\":%.9f,\"began_at\":%.9f,\"parse_at\":%.9f,\"parsed_at\":%.9f,\"render_at\":%.9f,\"input_read\":%s}\n",
++        monotonic_t_to_s_double(monotonic()), monotonic_t_to_s_double(loop_at), monotonic_t_to_s_double(parse_at), monotonic_t_to_s_double(parsed_at), monotonic_t_to_s_double(now), input_read ? "true" : "false");
+ #ifdef __APPLE__
+     if (has_cocoa_pending_actions) {
+         process_cocoa_pending_actions();
 diff --git a/kitty/child.py b/kitty/child.py
 index 560a60040..be5c0a617 100644
 --- a/kitty/child.py
@@ -217,11 +568,73 @@ index bc4f60db4..673de34ab 100644
      METHODB(get_fallback_font, METH_VARARGS),
      {"specialize_font_descriptor", (PyCFunction)pyspecialize_font_descriptor, METH_VARARGS, ""},
      {"render_box_char", (PyCFunction)pyrender_box_char, METH_VARARGS, ""},
+diff --git a/kitty/glfw-wrapper.c b/kitty/glfw-wrapper.c
+index a6ac38219..a98115766 100644
+--- a/kitty/glfw-wrapper.c
++++ b/kitty/glfw-wrapper.c
+@@ -488,6 +488,9 @@ load_glfw(const char* path) {
+     *(void **) (&glfwCocoaRequestRenderFrame_impl) = dlsym(handle, "glfwCocoaRequestRenderFrame");
+     if (glfwCocoaRequestRenderFrame_impl == NULL) dlerror(); // clear error indicator
+ 
++    *(void **) (&glfwCocoaGetRenderFrameTiming_impl) = dlsym(handle, "glfwCocoaGetRenderFrameTiming");
++    if (glfwCocoaGetRenderFrameTiming_impl == NULL) dlerror(); // clear error indicator
++
+     *(void **) (&glfwCocoaRecreateGLDrawable_impl) = dlsym(handle, "glfwCocoaRecreateGLDrawable");
+     if (glfwCocoaRecreateGLDrawable_impl == NULL) dlerror(); // clear error indicator
+ 
+diff --git a/kitty/glfw-wrapper.h b/kitty/glfw-wrapper.h
+index 235ab0ff7..f81fed075 100644
+--- a/kitty/glfw-wrapper.h
++++ b/kitty/glfw-wrapper.h
+@@ -2562,6 +2562,10 @@ typedef void (*glfwCocoaRequestRenderFrame_func)(GLFWwindow*, GLFWcocoarenderfra
+ GFW_EXTERN glfwCocoaRequestRenderFrame_func glfwCocoaRequestRenderFrame_impl;
+ #define glfwCocoaRequestRenderFrame glfwCocoaRequestRenderFrame_impl
+ 
++typedef int (*glfwCocoaGetRenderFrameTiming_func)(GLFWwindow*, double*, unsigned long long*);
++GFW_EXTERN glfwCocoaGetRenderFrameTiming_func glfwCocoaGetRenderFrameTiming_impl;
++#define glfwCocoaGetRenderFrameTiming glfwCocoaGetRenderFrameTiming_impl
++
+ typedef bool (*glfwCocoaRecreateGLDrawable_func)(GLFWwindow*);
+ GFW_EXTERN glfwCocoaRecreateGLDrawable_func glfwCocoaRecreateGLDrawable_impl;
+ #define glfwCocoaRecreateGLDrawable glfwCocoaRecreateGLDrawable_impl
+diff --git a/kitty/glfw.c b/kitty/glfw.c
+index a1409d731..f515b64fc 100644
+--- a/kitty/glfw.c
++++ b/kitty/glfw.c
+@@ -3449,6 +3449,14 @@ static void
+ cocoa_frame_request_callback(GLFWwindow *window) {
+     for (size_t i = 0; i < global_state.num_os_windows; i++) {
+         if (global_state.os_windows[i].handle == window) {
++            if (screen_tui_trace_enabled()) {
++                double v[12] = {0}; unsigned long long c[5] = {0};
++                if (glfwCocoaGetRenderFrameTiming(window, v, c)) {
++                    screen_tui_trace("{\"event\":\"display_callback\",\"time\":%.9f,\"os_window\":%llu,\"display_id\":%.0f,\"request_at\":%.9f,\"cv_callback_at\":%.9f,\"dispatch_at\":%.9f,\"host_now\":%.9f,\"host_output\":%.9f,\"refresh_period\":%.9f,\"rate_scalar\":%.9f,\"callback_gap\":%.9f,\"output_lead\":%.9f,\"dispatch_delay\":%.9f,\"expected_at\":%.9f,\"callbacks\":%llu,\"dispatches\":%llu,\"starts\":%llu,\"stops\":%llu,\"recreates\":%llu}\n",
++                        monotonic_t_to_s_double(monotonic()), (unsigned long long)global_state.os_windows[i].id,
++                        v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],c[0],c[1],c[2],c[3],c[4]);
++                }
++            }
+             global_state.os_windows[i].render_state = RENDER_FRAME_READY;
+             global_state.os_windows[i].last_render_frame_received_at = monotonic();
+             request_tick_callback();
+diff --git a/kitty/keys.c b/kitty/keys.c
+index 8e7edf98e..f08db7cbe 100644
+--- a/kitty/keys.c
++++ b/kitty/keys.c
+@@ -198,6 +198,9 @@ send_key_to_child(id_type window_id, Screen *screen, const GLFWkeyevent *ev) {
+     const int action = ev->action;
+     const uint32_t key = ev->key, native_key = ev->native_key;
+     const char *text = ev->text ? ev->text : "";
++    if ((key == 'j' || key == 'k' || key == GLFW_FKEY_F8) && screen_tui_trace_enabled())
++        screen_tui_trace("{\"event\":\"navigation_key\",\"time\":%.9f,\"window\":%llu,\"key\":%u,\"action\":%d}\n",
++            monotonic_t_to_s_double(monotonic()), (unsigned long long)window_id, key, action);
+ 
+     if (action == GLFW_REPEAT && !screen->modes.mDECARM) {
+         debug("discarding repeat key event as DECARM is off\n");
 diff --git a/kitty/mouse.c b/kitty/mouse.c
-index 512b612db..d9335421e 100644
+index 512b612db..b066eeda1 100644
 --- a/kitty/mouse.c
 +++ b/kitty/mouse.c
-@@ -1643,6 +1643,41 @@ scroll_event(const GLFWScrollEvent *ev) {
+@@ -1643,6 +1643,34 @@ scroll_event(const GLFWScrollEvent *ev) {
              osw->scroll.pending_pixels_y = 0.0;
              if (screen_apply_pixel_scroll(screen, delta_pixels) && screen->selections.in_progress) update_drag(w);
          } else {
@@ -245,14 +658,7 @@ index 512b612db..d9335421e 100644
 +                        if (owner->open_id == c->owner_id && !owner->closing && (!pane || priority >= pane_priority)) { pane = c; pane_priority = priority; }
 +                    }
 +                }
-+                if (pane) {
-+                    float position, velocity;
-+                    screen_tui_pane_scroll_sample(pane, sample_at, &position, &velocity);
-+                    float limit = (float)(pane->bottom - pane->top);
-+                    pane->offset = MAX(-limit, MIN(limit, position + (float)(pixels / cell_height)));
-+                    pane->velocity = 0.f; pane->last_input_at = now;
-+                    pane->started_at = now + ms_to_monotonic_t(80);
-+                }
++                if (pane) screen_tui_pane_scroll_apply_direct(screen, pane, (float)(pixels / cell_height), now);
 +                float offset = screen_tui_scroll_offset(screen, sample_at) + (float)(pixels / cell_height);
 +                screen->tui_scroll.offset = MAX(-(float)screen->lines, MIN((float)screen->lines, offset));
 +                screen->tui_scroll.velocity = 0.f;
@@ -264,10 +670,80 @@ index 512b612db..d9335421e 100644
                  screen->modes.mouse_tracking_mode,
                  ev->y_offset,
 diff --git a/kitty/screen.c b/kitty/screen.c
-index f0af2419f..0a29866d7 100644
+index f0af2419f..8a089e49a 100644
 --- a/kitty/screen.c
 +++ b/kitty/screen.c
-@@ -139,6 +139,8 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
+@@ -41,10 +41,69 @@
+ #include "wcswidth.h"
+ #include <stdalign.h>
+ #include <stdio.h>
++#include <stdarg.h>
+ #include "keys.h"
+ #include "vt-parser.h"
+ #include "resize.h"
+ 
++// Opt-in submitted-pose diagnostics: bounded RAM only during rendering.
++// Flush once at normal exit; never perform file I/O while drawing a frame.
++static struct {
++    char *path, *data;
++    size_t used, capacity;
++    unsigned records;
++    monotonic_t cpu_total, cpu_max;
++    bool initialized;
++} tui_trace;
++
++static void
++flush_tui_trace(void) {
++    FILE *output = tui_trace.path ? fopen(tui_trace.path, "w") : NULL;
++    if (output) {
++        if (tui_trace.used) fwrite(tui_trace.data, 1, tui_trace.used, output);
++        fprintf(output, "{\"event\":\"trace_summary\",\"records\":%u,\"bytes\":%zu,\"truncated\":%s,\"build\":\"%s %s\",\"writer_cpu_ms\":%.6f,\"writer_max_ms\":%.6f}\n",
++            tui_trace.records, tui_trace.used, tui_trace.records >= 250000 ? "true" : "false", __DATE__, __TIME__,
++            1000. * monotonic_t_to_s_double(tui_trace.cpu_total), 1000. * monotonic_t_to_s_double(tui_trace.cpu_max));
++        fclose(output);
++    }
++    free(tui_trace.path); free(tui_trace.data);
++    tui_trace.path = tui_trace.data = NULL;
++}
++
++bool
++screen_tui_trace_enabled(void) {
++    if (!tui_trace.initialized) {
++        tui_trace.initialized = true;
++        const char *path = getenv("KITTY_SMOOTH_FRAME_LOG");
++        if (path && *path) {
++            tui_trace.capacity = 64 * 1024 * 1024;
++            tui_trace.data = malloc(tui_trace.capacity);
++            if (tui_trace.data) tui_trace.path = strdup(path);
++            if (tui_trace.path && atexit(flush_tui_trace) == 0) return true;
++            free(tui_trace.path); free(tui_trace.data);
++            tui_trace.path = tui_trace.data = NULL;
++        }
++    }
++    return tui_trace.data && tui_trace.records < 250000;
++}
++
++void
++screen_tui_trace(const char *fmt, ...) {
++    if (!screen_tui_trace_enabled()) return;
++    const monotonic_t began_at = monotonic();
++    size_t available = tui_trace.capacity - tui_trace.used;
++    va_list args;
++    va_start(args, fmt);
++    int written = vsnprintf(tui_trace.data + tui_trace.used, available, fmt, args);
++    va_end(args);
++    if (written < 0 || (size_t)written >= available) { tui_trace.records = 250000; return; }
++    tui_trace.used += (size_t)written;
++    tui_trace.records++;
++    const monotonic_t elapsed = monotonic() - began_at;
++    tui_trace.cpu_total += elapsed;
++    tui_trace.cpu_max = MAX(tui_trace.cpu_max, elapsed);
++}
++
+ static const ScreenModes empty_modes = {0, .mDECAWM = true, .mDECTCEM = true, .mDECARM = true};
+ 
+ #define CSI_REP_MAX_REPETITIONS 65535u
+@@ -139,6 +198,8 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
              Py_CLEAR(self);
              return PyErr_NoMemory();
          }
@@ -276,7 +752,7 @@ index f0af2419f..0a29866d7 100644
          self->reload_all_gpu_data = true;
          self->cell_size.width = cell_width;
          self->cell_size.height = cell_height;
-@@ -208,6 +210,8 @@ static Line *range_line_(Screen *self, int y);
+@@ -208,6 +269,8 @@ static Line *range_line_(Screen *self, int y);
  
  static void
  do_screen_reset(Screen *self, bool is_hard_reset) {
@@ -285,7 +761,7 @@ index f0af2419f..0a29866d7 100644
      screen_pause_rendering(self, false, 0);
      self->dnd_chunking.active = false;
      self->extra_cursors.count = 0;
-@@ -273,9 +277,38 @@ screen_soft_reset(Screen *self) {
+@@ -273,9 +336,38 @@ screen_soft_reset(Screen *self) {
      self->cursor->y = y;
  }
  
@@ -325,7 +801,7 @@ index f0af2419f..0a29866d7 100644
      for (index_type i = 0; i < self->lines; i++) {
          linebuf_mark_line_dirty(self->main_linebuf, i);
          linebuf_mark_line_dirty(self->alt_linebuf, i);
-@@ -642,6 +675,10 @@ remove_blank_output_line_reservation_marker(Cursor *cursor, LineBuf *linebuf) {
+@@ -642,6 +734,10 @@ remove_blank_output_line_reservation_marker(Cursor *cursor, LineBuf *linebuf) {
  
  static bool
  screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
@@ -336,7 +812,7 @@ index f0af2419f..0a29866d7 100644
      screen_pause_rendering(self, false, 0);
      lines = MAX(1u, lines);
      columns = MAX(1u, columns);
-@@ -805,6 +842,16 @@ dealloc(Screen *self) {
+@@ -805,6 +901,16 @@ dealloc(Screen *self) {
      Py_CLEAR(self->overlay_line.overlay_text);
      PyMem_Free(self->main_tabstops);
      Py_CLEAR(self->paused_rendering.linebuf);
@@ -353,7 +829,7 @@ index f0af2419f..0a29866d7 100644
      Py_CLEAR(self->paused_rendering.grman);
      free(self->selections.items);
      free(self->url_ranges.items);
-@@ -1096,6 +1143,21 @@ screen_garbage_collect_text_cache(Screen *self) {
+@@ -1096,6 +1202,21 @@ screen_garbage_collect_text_cache(Screen *self) {
      text_cache_gc_process_linebuf(self->text_cache, gc, self->main_linebuf);
      text_cache_gc_process_linebuf(self->text_cache, gc, self->alt_linebuf);
      text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.linebuf);
@@ -375,7 +851,7 @@ index f0af2419f..0a29866d7 100644
      if (self->overlay_line.cpu_cells) text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.cpu_cells, self->overlay_line.xnum);
      if (self->overlay_line.original_line.cpu_cells)
          text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.original_line.cpu_cells, self->overlay_line.xnum);
-@@ -1956,6 +2018,8 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
+@@ -1956,6 +2077,8 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
  void
  screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_screen) {
      bool to_alt = self->linebuf == self->main_linebuf;
@@ -384,7 +860,7 @@ index f0af2419f..0a29866d7 100644
      self->active_hyperlink_id = 0;
      reset_pixel_scroll(self, 0);
      if (to_alt) {
-@@ -3812,11 +3876,62 @@ copy_selections(Selections *dest, const Selections *src) {
+@@ -3812,11 +3935,218 @@ copy_selections(Selections *dest, const Selections *src) {
      return true;
  }
  
@@ -404,10 +880,145 @@ index f0af2419f..0a29866d7 100644
 +    destination->line_attrs[row].has_dirty_text = dirty;
 +}
 +
++// A common nonnegative cubic B-spline kernel convolves committed viewport
++// origins. Every row contributes a finite smooth velocity pulse; overlapping
++// regular key repeats form constant velocity without predicting future rows.
++static void
++tui_scroll_kernel(double age, double width, double *remaining, double *speed) {
++    double u = age / width;
++    if (u <= 0.) { *remaining = 1.; *speed = 0.; return; }
++    if (u >= 4.) { *remaining = *speed = 0.; return; }
++    double q = u <= 2. ? u : 4. - u;
++    double a = q > 1. ? q - 1. : 0.;
++    double integral = (q*q*q*q - 4.*a*a*a*a) / 24.;
++    *remaining = u <= 2. ? 1. - integral : integral;
++    *speed = (q*q*q - 4.*a*a*a) / (6.*width);
++}
++
++void
++screen_tui_pane_scroll_set_direct(TUIScrollContext *c, float offset, monotonic_t hold_until) {
++    // Materialize the current pose before discarding pulses: bounds, direct
++    // touch input and capacity fallback must never resurrect old trajectories.
++    c->motion.count = 0;
++    c->world_offset += (double)offset - c->offset;
++    c->motion.tail_offset = c->offset = offset;
++    c->motion.tail_velocity = c->velocity = 0.f;
++    c->started_at = hold_until;
++}
++
++static void
++tui_pane_scroll_evolve(TUIScrollContext *c, monotonic_t now) {
++    if (!c->started_at || now <= c->started_at) return;
++    float dt = (float)monotonic_t_to_s_double(now - c->started_at);
++    tui_scroll_motion_sample(c->motion.tail_offset, c->motion.tail_velocity, dt, c->animation_length,
++                            &c->motion.tail_offset, &c->motion.tail_velocity);
++    if (fabsf(c->motion.tail_offset) < .001f && fabsf(c->motion.tail_velocity) < .02f)
++        c->motion.tail_offset = c->motion.tail_velocity = 0.f;
++    double position = c->motion.tail_offset, velocity = c->motion.tail_velocity;
++    unsigned kept = 0;
++    for (unsigned i = 0; i < c->motion.count; i++) {
++        double age = monotonic_t_to_s_double(now - c->motion.pulses[i].at), remaining, speed;
++        tui_scroll_kernel(age, c->motion.width, &remaining, &speed);
++        if (remaining == 0.) continue;
++        position += c->motion.pulses[i].delta * remaining;
++        velocity -= c->motion.pulses[i].delta * speed;
++        c->motion.pulses[kept++] = c->motion.pulses[i];
++    }
++    c->motion.count = kept;
++    // Integrate actual motion in world coordinates. Row rebases never touch
++    // this value, including at exact half-pixel rounding boundaries.
++    c->world_offset += position - c->offset;
++    if (!kept && position == 0.) c->world_offset = -c->logical_origin;
++    c->offset = position; c->velocity = (float)velocity;
++    c->started_at = kept || position != 0. || velocity != 0. ? now : 0;
++    float limit = c->bottom - c->top;
++    if (fabs(c->offset) > limit)
++        screen_tui_pane_scroll_set_direct(c, copysign(limit, c->offset), now);
++}
++
++void
++screen_tui_pane_scroll_apply_direct(Screen *s, TUIScrollContext *c, float delta, monotonic_t now) {
++    TUIScrollContext *displayed = c;
++    if (s->paused_rendering.expires_at && s->tui_layers.frozen) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            TUIScrollContext *old = &s->tui_frozen_scroll[i];
++            if (&s->tui_pane_scroll[i] == c && c->owner_id == old->owner_id && c->top == old->top &&
++                c->bottom == old->bottom && c->left == old->left && c->right == old->right) {
++                displayed = old;
++                break;
++            }
++        }
++    }
++    // Direct input starts from the old target's event-time pose, even when
++    // the last display callback was earlier or a new native frame is pending.
++    tui_pane_scroll_evolve(displayed, now);
++    float limit = displayed->bottom - displayed->top;
++    monotonic_t hold_until = now + ms_to_monotonic_t(80);
++    screen_tui_pane_scroll_set_direct(displayed, MAX(-limit, MIN(limit, displayed->offset + delta)), hold_until);
++    displayed->last_input_at = now;
++    if (displayed != c) {
++        float position = displayed->offset + (c->frame_source ? c->frame_delta : 0);
++        screen_tui_pane_scroll_set_direct(c, MAX(-limit, MIN(limit, position)), hold_until);
++        c->last_input_at = now;
++    }
++}
++
++static void
++tui_pane_scroll_append(Screen *s, TUIScrollContext *c, int delta, monotonic_t now) {
++    if (!delta) return;
++    const double old_offset = c->offset, old_velocity = c->velocity;
++    const double old_pixels = screen_tui_pane_scroll_pixels(c, s->cell_size.height);
++    const double old_legacy_pixels = roundf((float)old_offset * s->cell_size.height);
++    c->logical_origin += delta;
++    double gap = c->motion.last_commit_at ? monotonic_t_to_s_double(now - c->motion.last_commit_at) : 0.;
++    bool small = abs(delta) <= 4 && abs(c->motion.last_delta) <= 4;
++    if (small && delta * c->motion.last_delta > 0 && gap > 0. && gap <= .150) {
++        float cadence = (float)(gap / abs(delta));
++        c->motion.cadence = c->motion.cadence > 0.f ? .8f*c->motion.cadence + .2f*cadence : cadence;
++    }
++    c->motion.last_commit_at = now; c->motion.last_delta = delta;
++    if (c->motion.count == arraysz(c->motion.pulses)) {
++        // Bounded storage fallback preserves both current position and speed.
++        c->motion.tail_offset = c->offset; c->motion.tail_velocity = c->velocity;
++        c->motion.count = 0;
++    }
++    if (!c->motion.count) {
++        float scale = (c->animation_length > 0.f ? c->animation_length : .10f) / .10f;
++        float cadence = c->motion.cadence > 0.f ? c->motion.cadence : .040f;
++        // Keep one width for all overlapping signed pulses. Changing it mid-
++        // burst would break the committed-history convex-hull guarantee.
++        // A cold burst must also filter slower key repeats before enough
++        // cadence samples exist. Forty milliseconds keeps ordinary 20--50ms
++        // repeat streams smooth; the shared kernel remains causal and finite.
++        c->motion.width = MAX(.040f, MIN(.050f, cadence)) * scale;
++    }
++    unsigned n = c->motion.count++;
++    c->motion.pulses[n].at = now; c->motion.pulses[n].delta = delta;
++    c->offset += delta;
++    if (!c->started_at || c->started_at <= now) c->started_at = now;
++    double limit = c->bottom - c->top;
++    bool clamped = fabs(c->offset) > limit;
++    if (clamped) screen_tui_pane_scroll_set_direct(c, copysign(limit, c->offset), now);
++    if (screen_tui_trace_enabled()) {
++        double new_pixels = screen_tui_pane_scroll_pixels(c, s->cell_size.height);
++        double new_legacy_pixels = roundf((float)c->offset * s->cell_size.height);
++        double origin_delta_pixels = (double)delta * s->cell_size.height;
++        screen_tui_trace("{\"event\":\"commit\",\"time\":%.9f,\"window\":%llu,\"owner\":%u,\"delta\":%d,\"cell_height\":%u,\"old_offset_rows\":%.17g,\"new_offset_rows\":%.17g,\"old_velocity\":%.9g,\"new_velocity\":%.9g,\"old_pixels\":%.17g,\"new_pixels\":%.17g,\"error_pixels\":%.17g,\"legacy_error_pixels\":%.17g,\"clamped\":%s}\n",
++            monotonic_t_to_s_double(now), (unsigned long long)s->window_id, c->owner_id, delta, s->cell_size.height,
++            old_offset, c->offset, old_velocity, (double)c->velocity, old_pixels, new_pixels,
++            new_pixels - old_pixels - origin_delta_pixels, new_legacy_pixels - old_legacy_pixels - origin_delta_pixels,
++            clamped ? "true" : "false");
++    }
++}
++
  bool
  screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
      if (!pause) {
          if (!self->paused_rendering.expires_at) return false;
++        if (screen_tui_trace_enabled())
++            screen_tui_trace("{\"event\":\"sync_end\",\"time\":%.9f,\"window\":%llu,\"began_at\":%.9f}\n",
++                monotonic_t_to_s_double(monotonic()), (unsigned long long)self->window_id,
++                monotonic_t_to_s_double(self->tui_update_started_at));
 +        if (self->tui_update_started_at && self->tui_scroll.enabled) {
 +            monotonic_t now = monotonic();
 +            resume_tui_clock(&self->tui_scroll.started_at, self->tui_update_started_at, now);
@@ -416,23 +1027,44 @@ index f0af2419f..0a29866d7 100644
 +                const TUIScrollContext *old = &self->tui_frozen_scroll[i];
 +                bool touchpad = c->last_input_at && now - c->last_input_at < ms_to_monotonic_t(220);
 +                if (self->tui_layers.frozen && !touchpad && c->owner_id == old->owner_id && c->top == old->top && c->bottom == old->bottom && c->left == old->left && c->right == old->right) {
-+                    // Advance the OLD target to the atomic content commit.
-+                    // Only then rebase its origin: the new delta must not be
-+                    // integrated over time before this content became visible.
-+                    float position = old->offset, velocity = old->velocity;
-+                    if (old->started_at && now > old->started_at) {
-+                        float dt = (float)monotonic_t_to_s_double(now - old->started_at);
-+                        tui_scroll_motion_sample(position, velocity, dt, old->animation_length, &position, &velocity);
-+                    }
-+                    position += c->frame_source ? c->frame_delta : 0;
-+                    float limit = c->bottom - c->top;
-+                    c->offset = MAX(-limit, MIN(limit, position));
-+                    c->velocity = fabsf(position) > limit ? 0.f : velocity;
-+                    c->started_at = c->offset != 0.f || c->velocity != 0.f ? now : 0;
++                    // Copy the old displayed history, advance its old target to
++                    // commit, and only then append this atomic content change.
++                    c->motion = old->motion; c->logical_origin = old->logical_origin;
++                    c->world_offset = old->world_offset;
++                    c->offset = old->offset; c->velocity = old->velocity;
++                    c->started_at = old->started_at;
++                    tui_pane_scroll_evolve(c, now);
++                    if (c->frame_source) tui_pane_scroll_append(self, c, c->frame_delta, now);
 +                } else if (touchpad) {
-+                    resume_tui_clock(&c->started_at, self->tui_update_started_at, now);
++                    if (self->tui_layers.frozen && c->owner_id == old->owner_id && c->top == old->top && c->bottom == old->bottom && c->left == old->left && c->right == old->right) {
++                        // Direct pixel input already changed the frozen displayed
++                        // pose. Rebase that pose once, preserving its absolute hold.
++                        c->motion = old->motion; c->logical_origin = old->logical_origin;
++                        c->world_offset = old->world_offset;
++                        c->offset = old->offset; c->velocity = old->velocity;
++                        c->started_at = old->started_at;
++                        tui_pane_scroll_evolve(c, now);
++                        int delta = c->frame_source ? c->frame_delta : 0;
++                        c->logical_origin += delta;
++                        c->offset += delta; c->motion.tail_offset += delta;
++                        float limit = c->bottom - c->top;
++                        if (fabs(c->offset) > limit)
++                            screen_tui_pane_scroll_set_direct(c, copysign(limit, c->offset), c->started_at > now ? c->started_at : now);
++                        if (!c->started_at && (c->offset != 0.f || c->velocity != 0.f)) c->started_at = now;
++                    } else {
++                        if (c->frame_source) {
++                            c->logical_origin += c->frame_delta;
++                            c->world_offset -= c->frame_delta;
++                        }
++                        // Direct input uses absolute event-time holds even when
++                        // a new owner has no matching frozen viewport.
++                        tui_pane_scroll_evolve(c, now);
++                    }
 +                } else if (c->frame_source) {
-+                    c->started_at = now;
++                    // A new owner/region has no preceding viewport trajectory.
++                    memset(&c->motion, 0, sizeof(c->motion));
++                    c->logical_origin = c->world_offset = 0.; c->offset = c->velocity = 0.f; c->started_at = 0;
++                    tui_pane_scroll_append(self, c, c->frame_delta, now);
 +                }
 +            }
 +            resume_tui_clock(&self->tui_scene.started_at, self->tui_update_started_at, now);
@@ -447,7 +1079,7 @@ index f0af2419f..0a29866d7 100644
          // ensure cell data is updated on GPU
          self->is_dirty = true;
          // ensure selection data is updated on GPU
-@@ -3834,7 +3949,48 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
+@@ -3834,7 +4164,48 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
      if (!self->paused_rendering.grman) self->paused_rendering.grman = grman_alloc(true);
      if (!self->paused_rendering.grman) return false;
      if (for_in_ms <= 0) for_in_ms = 2000;
@@ -497,7 +1129,7 @@ index f0af2419f..0a29866d7 100644
      self->paused_rendering.inverted = self->modes.mDECSCNM;
      self->paused_rendering.scrolled_by = self->scrolled_by;
      self->paused_rendering.cell_data_updated = false;
-@@ -3933,16 +4089,653 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
+@@ -3933,16 +4304,711 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
  }
  
  
@@ -656,6 +1288,52 @@ index f0af2419f..0a29866d7 100644
 +    s->cursor->x = s->cursor->y = 0;
 +}
 +
++// Native exports are complete ANSI grids, so their fresh rows start dirty
++// even when identical glyphs already exist in the preceding native surface.
++// Reuse only whole rows with exactly the same shaping input and cell styling.
++// Both generations share the screen font/text cache and use NULL cursor with
++// DISABLE_LIGATURES_NEVER. Never inherit glyphs from a dirty/font-invalid row.
++static bool
++tui_reuse_native_glyph_row(LineBuf *dest, unsigned y, LineBuf *source, int source_y) {
++    if (!source || dest->xnum != source->xnum || dest->text_cache != source->text_cache ||
++        source_y < 0 || (unsigned)source_y >= source->ynum || source->line_attrs[source_y].has_dirty_text) return false;
++    CPUCell *dc, *sc; GPUCell *dg, *sg;
++    linebuf_init_cells(dest, y, &dc, &dg);
++    linebuf_init_cells(source, (unsigned)source_y, &sc, &sg);
++    if (memcmp(dc, sc, dest->xnum * sizeof(CPUCell))) return false;
++    for (unsigned x = 0; x < dest->xnum; x++) {
++        if (dg[x].fg != sg[x].fg || dg[x].bg != sg[x].bg || dg[x].decoration_fg != sg[x].decoration_fg || dg[x].attrs.val != sg[x].attrs.val) return false;
++    }
++    for (unsigned x = 0; x < dest->xnum; x++) dg[x].sprite_idx = sg[x].sprite_idx;
++    dest->line_attrs[y].has_dirty_text = false;
++    dest->line_attrs[y].has_image_placeholders = source->line_attrs[source_y].has_image_placeholders;
++    return true;
++}
++
++static void
++tui_reuse_native_glyphs(Screen *s, unsigned slot, TUIRetainedLayer *layer) {
++    if (!layer->current || !layer->pending || s->reload_all_gpu_data) return;
++    static int disabled = -1;
++    if (disabled < 0) { const char *v = getenv("KITTY_SMOOTH_NO_NATIVE_GLYPH_REUSE"); disabled = v && *v && strcmp(v, "0"); }
++    if (disabled) return;
++    const bool trace = screen_tui_trace_enabled();
++    monotonic_t began = trace ? monotonic() : 0;
++    unsigned same = 0, shifted = 0;
++    for (unsigned y = 0; y < layer->pending->ynum; y++) {
++        if (!layer->pending->line_attrs[y].has_dirty_text) continue;
++        if (tui_reuse_native_glyph_row(layer->pending, y, layer->current, y)) { same++; continue; }
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIScrollContext *c = &s->tui_pane_scroll[i];
++            if (!c->owner_id || !c->frame_delta || y < c->top || y >= c->bottom) continue;
++            if (slot < TUI_WINDOW_SLOTS && s->tui_scene.windows[slot].open_id != c->owner_id) continue;
++            if (tui_reuse_native_glyph_row(layer->pending, y, layer->current, (int)y + c->frame_delta)) { shifted++; break; }
++        }
++    }
++    if (trace) screen_tui_trace("{\"event\":\"native_glyph_reuse\",\"time\":%.9f,\"window\":%llu,\"slot\":%u,\"rows\":%u,\"same_rows\":%u,\"shifted_rows\":%u,\"duration_ms\":%.6f}\n",
++        monotonic_t_to_s_double(began), (unsigned long long)s->window_id, slot, layer->pending->ynum, same, shifted,
++        1000. * monotonic_t_to_s_double(monotonic() - began));
++}
++
 +void
 +screen_tui_layers_commit(Screen *s) {
 +    screen_tui_layer_end(s);
@@ -677,6 +1355,7 @@ index f0af2419f..0a29866d7 100644
 +            }
 +        } else if (layer->pending) {
 +            content_changed = true;
++            tui_reuse_native_glyphs(s, i, layer);
 +            Py_CLEAR(layer->current);
 +            layer->current = layer->pending;
 +            layer->pending = NULL;
@@ -688,6 +1367,9 @@ index f0af2419f..0a29866d7 100644
 +        unsigned slot = tui_layer_slot(s, c->owner_id);
 +        if (c->owner_id && (s->tui_layers.overflow || slot >= TUI_WINDOW_SLOTS || !s->tui_layers.layers[slot].seen ||
 +            (c->buffer_id && s->tui_scene.windows[slot].buffer_id && c->buffer_id != s->tui_scene.windows[slot].buffer_id))) {
++            if (screen_tui_trace_enabled())
++                screen_tui_trace("{\"event\":\"reset\",\"time\":%.9f,\"reason\":\"inventory_or_buffer\",\"window\":%llu,\"owner\":%u,\"buffer\":%u,\"top\":%u,\"bottom\":%u,\"left\":%u,\"right\":%u}\n",
++                    monotonic_t_to_s_double(monotonic()), (unsigned long long)s->window_id, c->owner_id, c->buffer_id, c->top, c->bottom, c->left, c->right);
 +            screen_tui_pane_scroll_clear(c);
 +        } else {
 +            if (slot < TUI_WINDOW_SLOTS) c->buffer_id = s->tui_scene.windows[slot].buffer_id;
@@ -923,7 +1605,12 @@ index f0af2419f..0a29866d7 100644
 +    if (!c) for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) if (!s->tui_pane_scroll[i].owner_id) { c = &s->tui_pane_scroll[i]; break; }
 +    if (!c) return;
 +    bool same = c->owner_id == owner && c->top == top && c->bottom == bottom && c->left == left && c->right == right;
-+    if (!same) screen_tui_pane_scroll_clear(c);
++    if (!same) {
++        if (c->owner_id && screen_tui_trace_enabled())
++            screen_tui_trace("{\"event\":\"reset\",\"time\":%.9f,\"reason\":\"owner_or_region\",\"window\":%llu,\"owner\":%u,\"buffer\":%u,\"top\":%u,\"bottom\":%u,\"left\":%u,\"right\":%u}\n",
++                monotonic_t_to_s_double(monotonic()), (unsigned long long)s->window_id, c->owner_id, c->buffer_id, c->top, c->bottom, c->left, c->right);
++        screen_tui_pane_scroll_clear(c);
++    }
 +    c->bounce_strength = s->tui_bounce_strength; c->bounce_duration = s->tui_bounce_duration;
 +    c->animation_length = s->tui_scroll_animation_length;
 +    c->owner_id = owner; c->top = top; c->bottom = bottom; c->left = left; c->right = right;
@@ -932,12 +1619,9 @@ index f0af2419f..0a29866d7 100644
 +    // the new delta retroactively to the interval preceding this event.
 +    // Synchronized redraws perform this step at their atomic content commit.
 +    monotonic_t now = screen_tui_sample_time(s, monotonic());
-+    float position, velocity;
-+    screen_tui_pane_scroll_sample(c, now, &position, &velocity);
-+    if (!s->paused_rendering.expires_at && c->started_at && now > c->started_at) {
-+        float dt = (float)monotonic_t_to_s_double(now - c->started_at);
-+        tui_scroll_motion_sample(position, velocity, dt, c->animation_length, &position, &velocity);
-+    }
++    if (!s->paused_rendering.expires_at) tui_pane_scroll_evolve(c, now);
++    double position = c->offset;
++    float velocity = c->velocity;
 +    LineBuf *source = s->tui_layers.layers[TUI_WINDOW_SLOTS].current;
 +    unsigned slot = tui_layer_slot(s, owner);
 +    if (slot < TUI_WINDOW_SLOTS) c->buffer_id = s->tui_scene.windows[slot].buffer_id;
@@ -979,12 +1663,25 @@ index f0af2419f..0a29866d7 100644
 +    }
 +    LineBuf *tmp = c->retained; c->retained = c->scratch; c->scratch = tmp;
 +    float limit = (float)(bottom - top);
-+    c->offset = MAX(-limit, MIN(limit, position + delta));
 +    bool touchpad = c->last_input_at && now - c->last_input_at < ms_to_monotonic_t(220);
-+    c->velocity = touchpad || fabsf(position + delta) > limit ? 0.f : velocity;
-+    // Keep a future direct-input hold, but timestamp any elapsed interval
-+    // consumed above even while it still counts as recent touchpad input.
-+    if ((!s->paused_rendering.expires_at && c->started_at <= now) || (!touchpad && !c->started_at)) c->started_at = now;
++    if (touchpad) {
++        monotonic_t hold = c->started_at > now ? c->started_at : now;
++        screen_tui_pane_scroll_set_direct(c, MAX(-limit, MIN(limit, position + delta)), hold);
++        if (!s->paused_rendering.expires_at) {
++            c->logical_origin += delta;
++            c->world_offset -= delta;
++        }
++    } else if (!s->paused_rendering.expires_at) {
++        tui_pane_scroll_append(s, c, delta, now);
++    } else {
++        // Retained rows are prepared provisionally. No pulse becomes effective
++        // until the matching content is atomically committed.
++        double next_position = MAX(-limit, MIN(limit, position + delta));
++        c->world_offset += next_position - c->offset;
++        c->offset = next_position;
++        c->velocity = fabs(position + delta) > limit ? 0.f : velocity;
++        if (!c->started_at) c->started_at = now;
++    }
 +    if (s->tui_scene.cursor_initialized && tui_cursor_owner(s, s->tui_scene.target_x, s->tui_scene.target_y) == owner) {
 +        float x, y;
 +        screen_tui_cursor_sample(s, now, &x, &y);
@@ -1003,14 +1700,7 @@ index f0af2419f..0a29866d7 100644
 +        TUIScrollContext *c = &contexts[i];
 +        if (!c->started_at) continue;
 +        active = true;
-+        // High-resolution touch input can hold its direct position briefly.
-+        if (now <= c->started_at) continue;
-+        float dt = (float)monotonic_t_to_s_double(now - c->started_at);
-+        tui_scroll_motion_sample(c->offset, c->velocity, dt, c->animation_length, &c->offset, &c->velocity);
-+        c->started_at = now;
-+        if (fabsf(c->offset) < .001f && fabsf(c->velocity) < .02f) {
-+            c->started_at = 0; c->offset = c->velocity = 0.f;
-+        }
++        tui_pane_scroll_evolve(c, now);
 +    }
 +    // Render the final settled pose as well as every moving pose.
 +    return active;
@@ -1155,30 +1845,48 @@ index f0af2419f..0a29866d7 100644
  }
  
  
-@@ -4104,7 +4897,7 @@ screen_update_only_line_graphics_data(Screen *self) {
+@@ -4104,22 +5170,37 @@ screen_update_only_line_graphics_data(Screen *self) {
  }
  
  void
 -screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved) {
 +screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved, size_t capacity) {
++    const bool trace_details = screen_tui_trace_enabled();
++    enum { TRACE_MAIN, TRACE_FROZEN, TRACE_SCENE, TRACE_LEGACY, TRACE_NATIVE, TRACE_RETAINED, TRACE_OVERLAY, TRACE_STAGE_COUNT };
++    unsigned trace_rendered[TRACE_STAGE_COUNT] = {0}, trace_copied[TRACE_STAGE_COUNT] = {0};
++    monotonic_t trace_times[TRACE_STAGE_COUNT] = {0};
++    const monotonic_t trace_started = trace_details ? monotonic() : 0;
++    monotonic_t trace_stage_started = trace_started;
++    const bool trace_was_dirty = self->is_dirty, trace_reload = self->reload_all_gpu_data;
++    const bool trace_was_frozen = self->paused_rendering.expires_at != 0;
++#define TRACE_COPY_ROW(stage, row, width) do { \
++    if (trace_details && (width) && (size_t)(row) < capacity / ((size_t)(width) * sizeof(GPUCell))) trace_copied[stage]++; \
++} while (0)
      if (self->paused_rendering.expires_at) {
          if (!self->paused_rendering.cell_data_updated) {
              LineBuf *linebuf = self->paused_rendering.linebuf;
-@@ -4116,10 +4909,11 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+             for (index_type y = 0; y < self->lines; y++) {
+                 linebuf_init_line(linebuf, y);
+                 if (linebuf->line->attrs.has_dirty_text) {
++                    if (trace_details) trace_rendered[TRACE_FROZEN]++;
+                     render_line(fonts_data, linebuf->line, y, &self->paused_rendering.cursor, self->disable_ligatures, self->lc);
+                     // Cell images are not rendered here: this would modify the live grman using snapshot row numbers
                      if (linebuf->line->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linebuf->line, &self->as_ansi_buf);
                      linebuf_mark_line_clean(linebuf, y);
                  }
 -                update_line_data(linebuf->line, y, address);
++                TRACE_COPY_ROW(TRACE_FROZEN, y, linebuf->line->xnum);
 +                update_line_data(linebuf->line, y, address, capacity);
              }
          }
 -        return;
-+        if (!self->tui_layers.frozen) return;
++        if (trace_details) trace_times[TRACE_FROZEN] += monotonic() - trace_stage_started;
++        if (!self->tui_layers.frozen) goto trace_details_done;
 +        goto retained_cell_data;
      }
      const bool is_overlay_active = screen_is_overlay_active(self);
      unsigned int history_line_added_count = self->history_line_added_count;
-@@ -4128,7 +4922,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+@@ -4128,7 +5209,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
      const bool force_history_render = pixel_scroll_enabled(self) && self->scroll_changed;
      if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_added_count, self->historybuf->count);
      self->scroll_changed = false;
@@ -1187,47 +1895,76 @@ index f0af2419f..0a29866d7 100644
      const int render_row_offset = pixel_scroll_enabled(self);
      Line line = {.text_cache = self->text_cache};
      for (unsigned int render_row = 0; render_row < render_lines; render_row++) {
-@@ -4137,7 +4931,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+@@ -4137,7 +5218,8 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
          index_type lnum = 0;
          Line *linep = render_line_for_virtual_y(self, virtual_y, &line, &lnum, &is_history);
          if (linep == NULL) {
 -            update_line_data_blank(self->columns, render_row, address);
++            TRACE_COPY_ROW(TRACE_MAIN, render_row, self->columns);
 +            update_line_data_blank(self->columns, render_row, address, capacity);
              continue;
          }
          if (is_history) {
-@@ -4158,8 +4952,68 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+@@ -4145,28 +5227,125 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
+             // the unicode placeholder was first scanned can alter it.
+             screen_render_line_graphics(self, linep, virtual_y - (int)self->scrolled_by);
+             if (force_history_render || linep->attrs.has_dirty_text) {
++                if (trace_details) trace_rendered[TRACE_MAIN]++;
+                 render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc);
+                 if (screen_has_marker(self)) mark_text_in_line(self->marker, linep, &self->as_ansi_buf);
+                 historybuf_mark_line_clean(self->historybuf, lnum);
+             }
+         } else {
+             if (linep->attrs.has_dirty_text || (cursor_has_moved && (self->cursor->y == lnum || self->last_rendered.cursor.y == lnum))) {
++                if (trace_details) trace_rendered[TRACE_MAIN]++;
+                 render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc);
+                 screen_render_line_graphics(self, linep, virtual_y - (int)self->scrolled_by);
+                 if (linep->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linep, &self->as_ansi_buf);
+-                if (is_overlay_active && lnum == self->overlay_line.ynum) render_overlay_line(self, linep, fonts_data);
++                if (is_overlay_active && lnum == self->overlay_line.ynum) {
++                    if (trace_details) trace_rendered[TRACE_OVERLAY]++;
++                    render_overlay_line(self, linep, fonts_data);
++                }
                  linebuf_mark_line_clean(self->linebuf, lnum);
              }
          }
 -        update_line_data(linep, render_row, address);
++        TRACE_COPY_ROW(TRACE_MAIN, render_row, linep->xnum);
 +        update_line_data(linep, render_row, address, capacity);
 +    }
++    if (trace_details) trace_times[TRACE_MAIN] += monotonic() - trace_stage_started;
 +retained_cell_data:
++    if (trace_details) trace_stage_started = monotonic();
 +    if (screen_tui_scene_rows(self)) {
 +        LineBuf *lb = self->tui_scene.snapshot;
 +        unsigned base = self->lines + screen_tui_retained_rows(self);
 +        for (unsigned y = 0; y < self->lines; y++) {
 +            linebuf_init_line(lb, y);
 +            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                if (trace_details) trace_rendered[TRACE_SCENE]++;
 +                render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
 +                linebuf_mark_line_clean(lb, y);
 +            }
++            TRACE_COPY_ROW(TRACE_SCENE, base + y, lb->line->xnum);
 +            update_line_data(lb->line, base + y, address, capacity);
 +        }
-     }
++    }
++    if (trace_details) { trace_times[TRACE_SCENE] += monotonic() - trace_stage_started; trace_stage_started = monotonic(); }
 +    unsigned retained_rows = screen_tui_retained_rows(self);
 +    if (retained_rows) {
 +        LineBuf *lb = self->paused_rendering.expires_at ? self->tui_layers.frozen_legacy_retained : self->tui_scroll.retained;
 +        for (unsigned y = 0; y < retained_rows; y++) {
 +            linebuf_init_line(lb, y);
 +            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                if (trace_details) trace_rendered[TRACE_LEGACY]++;
 +                render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
 +                linebuf_mark_line_clean(lb, y);
 +            }
++            TRACE_COPY_ROW(TRACE_LEGACY, self->lines + y, lb->line->xnum);
 +            update_line_data(lb->line, self->lines + y, address, capacity);
 +        }
 +    }
++    if (trace_details) { trace_times[TRACE_LEGACY] += monotonic() - trace_stage_started; trace_stage_started = monotonic(); }
 +    if (screen_tui_layer_rows(self)) {
 +        unsigned base = self->lines + screen_tui_retained_rows(self) + screen_tui_scene_rows(self);
 +        unsigned packed = 0;
@@ -1237,17 +1974,20 @@ index f0af2419f..0a29866d7 100644
 +            if (!lb) continue;
 +            for (unsigned y = 0; y < self->lines; y++) {
 +                unsigned row = base + packed * self->lines + y;
-+                if (lb->xnum != self->columns || lb->ynum != self->lines) { update_line_data_blank(self->columns, row, address, capacity); continue; }
++                if (lb->xnum != self->columns || lb->ynum != self->lines) { TRACE_COPY_ROW(TRACE_NATIVE, row, self->columns); update_line_data_blank(self->columns, row, address, capacity); continue; }
 +                linebuf_init_line(lb, y);
 +                if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                    if (trace_details) trace_rendered[TRACE_NATIVE]++;
 +                    render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
 +                    linebuf_mark_line_clean(lb, y);
 +                }
++                TRACE_COPY_ROW(TRACE_NATIVE, row, lb->line->xnum);
 +                update_line_data(lb->line, row, address, capacity);
 +            }
 +            packed++;
 +        }
 +    }
++    if (trace_details) { trace_times[TRACE_NATIVE] += monotonic() - trace_stage_started; trace_stage_started = monotonic(); }
 +    unsigned pane_base = self->lines + screen_tui_retained_rows(self) + screen_tui_scene_rows(self) + screen_tui_layer_rows(self);
 +    for (unsigned i = 0; screen_tui_pane_retained_rows(self) && i < TUI_WINDOW_SLOTS; i++) {
 +        LineBuf *lb = screen_tui_render_scroll(self, i)->retained;
@@ -1255,18 +1995,45 @@ index f0af2419f..0a29866d7 100644
 +        for (unsigned y = 0; y < 2 * self->lines; y++) {
 +            linebuf_init_line(lb, y);
 +            if (lb->line->attrs.has_dirty_text || self->reload_all_gpu_data) {
++                if (trace_details) trace_rendered[TRACE_RETAINED]++;
 +                render_line(fonts_data, lb->line, y, NULL, DISABLE_LIGATURES_NEVER, self->lc);
 +                linebuf_mark_line_clean(lb, y);
 +            }
++            TRACE_COPY_ROW(TRACE_RETAINED, pane_base + y, lb->line->xnum);
 +            update_line_data(lb->line, pane_base + y, address, capacity);
 +        }
 +        pane_base += 2 * self->lines;
-+    }
-+    if (self->paused_rendering.expires_at) return;
+     }
++    if (trace_details) { trace_times[TRACE_RETAINED] += monotonic() - trace_stage_started; trace_stage_started = monotonic(); }
++    if (self->paused_rendering.expires_at) goto trace_details_done;
      if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
          if (self->overlay_line.is_dirty) {
              linebuf_init_line(self->linebuf, self->overlay_line.ynum);
-@@ -7187,7 +8041,83 @@ test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
++            if (trace_details) trace_rendered[TRACE_OVERLAY]++;
+             render_overlay_line(self, self->linebuf->line, fonts_data);
+         }
++        if (trace_details) trace_copied[TRACE_OVERLAY]++;
+         update_overlay_line_data(self, address);
+     }
++    if (trace_details) trace_times[TRACE_OVERLAY] += monotonic() - trace_stage_started;
++trace_details_done:
++    if (trace_details) {
++        size_t copied_rows = 0;
++        for (unsigned i = 0; i < TRACE_STAGE_COUNT; i++) copied_rows += trace_copied[i];
++        screen_tui_trace("{\"event\":\"cell_update_details\",\"time\":%.9f,\"window\":%llu,\"duration_ms\":%.6g,\"columns\":%u,\"lines\":%u,\"capacity_bytes\":%zu,\"copied_bytes\":%zu,\"dirty\":%s,\"reload\":%s,\"frozen\":%s,\"stage_names\":[\"main\",\"frozen\",\"scene\",\"legacy\",\"native\",\"retained\",\"overlay\"],\"rendered_rows\":[%u,%u,%u,%u,%u,%u,%u],\"copied_rows\":[%u,%u,%u,%u,%u,%u,%u],\"stage_ms\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]}\n",
++            monotonic_t_to_s_double(trace_started), (unsigned long long)self->window_id,
++            monotonic_t_to_s_double(monotonic() - trace_started) * 1000., self->columns, self->lines, capacity, copied_rows * self->columns * sizeof(GPUCell),
++            trace_was_dirty ? "true" : "false", trace_reload ? "true" : "false", trace_was_frozen ? "true" : "false",
++            trace_rendered[0], trace_rendered[1], trace_rendered[2], trace_rendered[3], trace_rendered[4], trace_rendered[5], trace_rendered[6],
++            trace_copied[0], trace_copied[1], trace_copied[2], trace_copied[3], trace_copied[4], trace_copied[5], trace_copied[6],
++            monotonic_t_to_s_double(trace_times[0])*1000., monotonic_t_to_s_double(trace_times[1])*1000., monotonic_t_to_s_double(trace_times[2])*1000.,
++            monotonic_t_to_s_double(trace_times[3])*1000., monotonic_t_to_s_double(trace_times[4])*1000., monotonic_t_to_s_double(trace_times[5])*1000., monotonic_t_to_s_double(trace_times[6])*1000.);
++    }
++#undef TRACE_COPY_ROW
+ }
+ 
+ static bool
+@@ -7187,7 +8366,83 @@ test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
      return Py_BuildValue("kkk", is_idx, idx, ca);
  }
  
@@ -1350,7 +2117,7 @@ index f0af2419f..0a29866d7 100644
      METHODB(test_create_write_buffer, METH_NOARGS),
      METHODB(test_commit_write_buffer, METH_VARARGS),
      METHODB(test_parse_written_data, METH_VARARGS),
-@@ -7226,7 +8156,24 @@ static PyMethodDef methods[] = {
+@@ -7226,7 +8481,24 @@ static PyMethodDef methods[] = {
      {NULL} /* Sentinel */
  };
  
@@ -1375,7 +2142,7 @@ index f0af2419f..0a29866d7 100644
      GETSET(in_bracketed_paste_mode) GETSET(color_preference_notification) GETSET(auto_repeat_enabled) GETSET(focus_tracking_enabled)
          GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(cursor_visible) GETSET(cursor_key_mode) GETSET(disable_ligatures)
              GETSET(render_unfocused_cursor){NULL} /* Sentinel */
-@@ -7252,6 +8199,10 @@ static PyMemberDef members[] = {
+@@ -7252,6 +8524,10 @@ static PyMemberDef members[] = {
      {"main_linebuf", T_OBJECT_EX, offsetof(Screen, main_linebuf), READONLY, "main_linebuf"},
      {"historybuf", T_OBJECT_EX, offsetof(Screen, historybuf), READONLY, "historybuf"},
      {"scrolled_by", T_UINT, offsetof(Screen, scrolled_by), READONLY, "scrolled_by"},
@@ -1387,7 +2154,7 @@ index f0af2419f..0a29866d7 100644
      {"lines", T_UINT, offsetof(Screen, lines), READONLY, "lines"},
      {"columns", T_UINT, offsetof(Screen, columns), READONLY, "columns"},
 diff --git a/kitty/screen.h b/kitty/screen.h
-index 262503380..2f3d135da 100644
+index 262503380..4e5cae67d 100644
 --- a/kitty/screen.h
 +++ b/kitty/screen.h
 @@ -11,6 +11,7 @@
@@ -1398,7 +2165,7 @@ index 262503380..2f3d135da 100644
  
  typedef enum ScrollTypes { SCROLL_LINE = -999999, SCROLL_PAGE, SCROLL_FULL } ScrollType;
  
-@@ -118,11 +119,69 @@ typedef struct ExtraCursors {
+@@ -118,11 +119,77 @@ typedef struct ExtraCursors {
  } ExtraCursors;
  
  
@@ -1418,7 +2185,15 @@ index 262503380..2f3d135da 100644
 +
 +typedef struct {
 +    unsigned top, bottom, left, right, owner_id, buffer_id;
-+    float offset, velocity, bounce_strength, bounce_duration, animation_length;
++    float velocity, bounce_strength, bounce_duration, animation_length;
++    double offset, logical_origin, world_offset;
++    struct {
++        struct { monotonic_t at; float delta; } pulses[128];
++        unsigned count;
++        float width, cadence, tail_offset, tail_velocity;
++        monotonic_t last_commit_at;
++        int last_delta;
++    } motion;
 +    monotonic_t started_at, last_input_at;
 +    LineBuf *retained, *scratch, *frame_source;
 +    int frame_delta;
@@ -1468,7 +2243,7 @@ index 262503380..2f3d135da 100644
      CellPixelSize cell_size;
      OverlayLine overlay_line;
      id_type window_id;
-@@ -229,8 +288,141 @@ typedef struct {
+@@ -229,8 +296,154 @@ typedef struct {
      } dnd_chunking;
  } Screen;
  
@@ -1540,6 +2315,15 @@ index 262503380..2f3d135da 100644
 +    *position = c->offset;
 +    *velocity = c->velocity;
 +}
++// Quantize the absolute displayed coordinate once, then rebase to the
++// current integer row origin. Half-pixel ties cannot change with scroll sign.
++static inline double
++screen_tui_pane_scroll_pixels(const TUIScrollContext *c, unsigned height) {
++    if (!height) return 0.;
++    double origin = c->logical_origin * height;
++    return floor(c->world_offset * height + .5) + origin;
++}
++
 +static inline const TUIScrollContext *screen_tui_render_scroll(const Screen *s, unsigned slot) {
 +    return s->paused_rendering.expires_at && s->tui_layers.frozen ? &s->tui_frozen_scroll[slot] : &s->tui_pane_scroll[slot];
 +}
@@ -1568,6 +2352,10 @@ index 262503380..2f3d135da 100644
 +bool screen_tui_pane_scroll_tick(Screen *s, monotonic_t now);
 +bool screen_tui_frozen_scroll_tick(Screen *s, monotonic_t now);
 +void screen_tui_pane_scroll_clear(TUIScrollContext *c);
++bool screen_tui_trace_enabled(void);
++void screen_tui_trace(const char *fmt, ...);
++void screen_tui_pane_scroll_set_direct(TUIScrollContext *c, float offset, monotonic_t hold_until);
++void screen_tui_pane_scroll_apply_direct(Screen *s, TUIScrollContext *c, float delta, monotonic_t now);
 +
 +static inline unsigned
 +screen_tui_retained_rows(const Screen *s) {
@@ -1611,7 +2399,7 @@ index 262503380..2f3d135da 100644
  
  void screen_align(Screen *);
  void screen_garbage_collect_text_cache(Screen *screen);
-@@ -310,7 +502,7 @@ bool screen_is_selection_dirty(Screen *self);
+@@ -310,7 +523,7 @@ bool screen_is_selection_dirty(Screen *self);
  bool screen_has_selection(Screen *);
  bool screen_is_cell_selected(Screen *, index_type x, index_type y);
  bool screen_invert_colors(Screen *self);
@@ -1621,14 +2409,32 @@ index 262503380..2f3d135da 100644
  unsigned screen_multi_cursor_count(const Screen *self);
  bool screen_selection_range_for_line(Screen *self, index_type y, index_type *start, index_type *end);
 diff --git a/kitty/shaders.c b/kitty/shaders.c
-index 5cb7cf637..764f4cb57 100644
+index 5cb7cf637..36edb68e8 100644
 --- a/kitty/shaders.c
 +++ b/kitty/shaders.c
-@@ -924,6 +924,16 @@ cell_update_uniform_block(
+@@ -19,6 +19,18 @@
+ #include "srgb_gamma.h"
+ #include "state.h"
+ 
++// Submitted pose metadata shares the commit/pipeline RAM trace. It is written
++// only at normal exit and contains no buffer text.
++static void
++trace_tui_pixel_pose(const Screen *screen, const TUIScrollContext *c, id_type os_window, monotonic_t now, double pixels, float prepared_pose_age_ms) {
++    if (!screen_tui_trace_enabled()) return;
++    screen_tui_trace(
++        "{\"event\":\"frame\",\"time\":%.9f,\"window\":%llu,\"os_window\":%llu,\"owner\":%u,\"frozen\":%s,\"offset_rows\":%.17g,\"offset_pixels\":%.17g,\"velocity\":%.9g,\"cell_height\":%u,\"origin_rows\":%.17g,\"pending_count\":%u,\"kernel_interval\":%.9g,\"prepared_pose_age_ms\":%.6g,\"world_offset_rows\":%.17g,\"top\":%u,\"bottom\":%u,\"left\":%u,\"right\":%u,\"retained_rows\":%u,\"columns\":%u,\"lines\":%u}\n",
++        monotonic_t_to_s_double(now), (unsigned long long)screen->window_id, (unsigned long long)os_window, c->owner_id,
++        screen->paused_rendering.expires_at && screen->tui_layers.frozen ? "true" : "false",
++        c->offset, pixels, c->velocity, screen->cell_size.height, c->logical_origin, c->motion.count, c->motion.width, prepared_pose_age_ms, c->world_offset, c->top, c->bottom, c->left, c->right, c->retained ? c->retained->ynum : 0, screen->columns, screen->lines);
++}
++
+ enum {
+     CELL_PROGRAM,
+     CELL_FG_PROGRAM,
+@@ -924,6 +936,15 @@ cell_update_uniform_block(
      OSWindow *os_window,
      float inactive_text_alpha,
      float bg_alpha) {
-+    const monotonic_t sample_at = monotonic();
 +    // Diagnostic isolation of cursor compositing from native text scrolling.
 +    CursorRenderInfo hidden_cursor;
 +    if (screen->tui_cursor_hidden && screen->tui_scroll.enabled) {
@@ -1641,7 +2447,7 @@ index 5cb7cf637..764f4cb57 100644
      struct GPUCellRenderData {
          // Colors that are constant for the whole draw, pre-converted to linear
          // space so the vertex shader does not do a gamma LUT lookup for them
-@@ -941,9 +951,18 @@ cell_update_uniform_block(
+@@ -941,9 +962,18 @@ cell_update_uniform_block(
          GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
          GLfloat cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
  
@@ -1660,7 +2466,33 @@ index 5cb7cf637..764f4cb57 100644
      // Send the uniform data
      ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
      if (cp->dirty || screen->reload_all_gpu_data) {
-@@ -978,6 +997,38 @@ cell_update_uniform_block(
+@@ -963,7 +993,25 @@ cell_update_uniform_block(
+         if ((size_t)crd_block.size < sizeof(struct GPUCellRenderData))
+             fatal("The CellRenderData uniform block is %d bytes but the C struct mirroring it is %zu bytes", crd_block.size, sizeof(struct GPUCellRenderData));
+     }
++    const bool trace_uniforms = screen_tui_trace_enabled();
++    monotonic_t trace_uniform_started = trace_uniforms ? monotonic() : 0;
+     struct GPUCellRenderData *rd = (struct GPUCellRenderData *)map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, crd_block.size);
++    monotonic_t trace_uniform_mapped = trace_uniforms ? monotonic() : 0;
++    // Font shaping, cell uploads and mapping this buffer may block. Advance
++    // native motion after that work, so every text/cursor uniform shares the
++    // current pose instead of the earlier render-preparation timestamp.
++    // Native evolution cannot change retained buffer packing; scene ticks can.
++    const monotonic_t sample_at = monotonic();
++    float prepared_pose_age_ms[TUI_WINDOW_SLOTS] = {0};
++    if (screen->tui_scroll.enabled && screen_tui_alternate_active(screen)) {
++        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
++            const TUIScrollContext *c = screen_tui_render_scroll(screen, i);
++            if (c->started_at && sample_at > c->started_at)
++                prepared_pose_age_ms[i] = 1000.f * (float)monotonic_t_to_s_double(sample_at - c->started_at);
++        }
++        if (screen->paused_rendering.expires_at) screen_tui_frozen_scroll_tick(screen, sample_at);
++        else screen_tui_pane_scroll_tick(screen, sample_at);
++    }
+ #define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
+     // The shaders need these only in linear space, they are converted and
+     // written into rd just before the buffer is unmapped. The cursor colors
+@@ -978,6 +1026,38 @@ cell_update_uniform_block(
      rd->bg_opacities0 = bg_alpha;
      rd->fg_override_threshold = OPT(text_fg_override_threshold);
      rd->row_offset = row_offset_for_screen(screen);
@@ -1699,7 +2531,7 @@ index 5cb7cf637..764f4cb57 100644
  #define SETBG(which) \
      { colorprofile_to_transparent_color(cp, which - 1, &rd->bg_colors##which, &rd->bg_opacities##which); }
      SETBG(1);
-@@ -1087,6 +1138,73 @@ cell_update_uniform_block(
+@@ -1087,6 +1167,66 @@ cell_update_uniform_block(
          rd->cursor_y2 = screen->lines;
      }
  
@@ -1711,30 +2543,23 @@ index 5cb7cf637..764f4cb57 100644
 +        for (unsigned slot = 0; slot < TUI_WINDOW_SLOTS; slot++) {
 +            const TUIWindowMotion *w = screen_tui_render_window(screen, slot);
 +            if (w->open_id != c->owner_id || w->closing) continue;
-+            float position, velocity;
-+            screen_tui_pane_scroll_sample(c, sample_at, &position, &velocity);
-+            if (screen->cell_size.height) position = roundf(position * screen->cell_size.height) / screen->cell_size.height;
++            // Quantize the absolute display origin before rebasing it into
++            // this viewport. Half-pixel ties must choose the same physical
++            // pixel on either side of an integer content-origin change.
++            double pixels = screen_tui_pane_scroll_pixels(c, screen->cell_size.height);
++            float position = screen->cell_size.height ? (float)(pixels / screen->cell_size.height) : (float)c->offset;
 +            rd->tui_pane_scroll_rects[slot][0] = c->left; rd->tui_pane_scroll_rects[slot][1] = c->top;
 +            rd->tui_pane_scroll_rects[slot][2] = c->right; rd->tui_pane_scroll_rects[slot][3] = c->bottom;
 +            rd->tui_pane_scroll_motion[slot][0] = position;
 +            rd->tui_pane_scroll_motion[slot][1] = 1.f;
-+        }
-+    }
-+    bool cursor_layout_moving = false;
-+    if (screen->tui_layers.active) {
-+        for (unsigned i = 0; i < TUI_WINDOW_SLOTS; i++) {
-+            const TUIWindowMotion *w = screen_tui_render_window(screen, i);
-+            if (!w->open_bottom || w->open_id != screen->tui_layers.focused_owner_id) continue;
-+            float dx, dy, vx, vy;
-+            screen_tui_window_sample_slot(screen, i, sample_at, &dx, &dy, &vx, &vy);
-+            if (fabsf(dx) + fabsf(dy) > .001f) { cursor_layout_moving = true; break; }
++            trace_tui_pixel_pose(screen, c, os_window->id, sample_at, pixels, prepared_pose_age_ms[i]);
 +        }
 +    }
 +    rd->tui_cursor_alpha = 0;
 +    rd->tui_cursor_kind = cursor->shape;
 +    rd->tui_cursor_left = rd->tui_cursor_top = rd->tui_cursor_right = rd->tui_cursor_bottom = 0;
 +    rd->tui_cursor_reserved0 = rd->tui_cursor_reserved1 = 0;
-+    if (!cursor_layout_moving && (!screen->paused_rendering.expires_at || screen->tui_layers.frozen) && screen->tui_scroll.enabled && cursor->is_visible && cursor->is_focused && cursor->shape != NO_CURSOR_SHAPE &&
++    if ((!screen->paused_rendering.expires_at || screen->tui_layers.frozen) && screen->tui_scroll.enabled && cursor->is_visible && cursor->is_focused && cursor->shape != NO_CURSOR_SHAPE &&
 +        (screen->tui_layers.active || screen->tui_scene.cursor_moving || screen->tui_scene.snapshot || screen_tui_windows_active(screen))) {
 +        float x = cursor->x, y = cursor->y;
 +        if (screen->paused_rendering.expires_at && screen->tui_layers.frozen) { x = screen->tui_layers.frozen_cursor_x; y = screen->tui_layers.frozen_cursor_y; }
@@ -1766,20 +2591,63 @@ index 5cb7cf637..764f4cb57 100644
 +        rd->tui_cursor_alpha = rd->cursor_opacity;
 +
 +    }
-+    if (rd->tui_cursor_alpha > 0 || cursor_layout_moving) {
++    if (rd->tui_cursor_alpha > 0) {
 +        rd->cursor_x1 = screen->columns + 1; rd->cursor_x2 = screen->columns;
 +        rd->cursor_y1 = screen->lines + 1; rd->cursor_y2 = screen->lines;
 +    }
      rd->columns = screen->columns;
      rd->lines = screen->lines;
  
-@@ -1136,14 +1254,14 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
+@@ -1112,19 +1252,31 @@ cell_update_uniform_block(
+     linear_color_vec4(rd->extra_cursor_fg_lin, dynamic_color_for_gpu(cp, rd->extra_cursor_fg));
+     linear_color_vec4(rd->extra_cursor_bg_lin, dynamic_color_for_gpu(cp, rd->extra_cursor_bg));
+     color_type default_bg = rd->bg_colors0;
++    if (trace_uniforms) screen_tui_trace("{\"event\":\"cursor_pose\",\"time\":%.9f,\"window\":%llu,\"os_window\":%llu,\"left\":%.9g,\"top\":%.9g,\"right\":%.9g,\"bottom\":%.9g,\"alpha\":%.9g,\"kind\":%.9g,\"hidden\":%s}\n",
++        monotonic_t_to_s_double(sample_at), (unsigned long long)screen->window_id, (unsigned long long)os_window->id,
++        (double)rd->tui_cursor_left, (double)rd->tui_cursor_top, (double)rd->tui_cursor_right, (double)rd->tui_cursor_bottom, (double)rd->tui_cursor_alpha, (double)rd->tui_cursor_kind, screen->tui_cursor_hidden ? "true" : "false");
++    monotonic_t trace_uniform_updated = trace_uniforms ? monotonic() : 0;
+     unmap_vao_buffer(vao_idx, uniform_buffer);
++    if (trace_uniforms) screen_tui_trace("{\"event\":\"render_phase\",\"phase\":\"uniforms\",\"time\":%.9f,\"window\":%llu,\"os_window\":%llu,\"map_ms\":%.6g,\"cpu_ms\":%.6g,\"unmap_ms\":%.6g}\n",
++        monotonic_t_to_s_double(trace_uniform_started), (unsigned long long)screen->window_id, (unsigned long long)os_window->id,
++        monotonic_t_to_s_double(trace_uniform_mapped - trace_uniform_started) * 1000., monotonic_t_to_s_double(trace_uniform_updated - trace_uniform_mapped) * 1000., monotonic_t_to_s_double(monotonic() - trace_uniform_updated) * 1000.);
+     rd = NULL;
+     return default_bg;
+ }
+ 
+ static bool
+-cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_data) {
++cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_data, id_type os_window) {
+     size_t sz;
+     CELL_BUFFERS;
+     void *address;
+     bool changed = false;
+ 
++    const bool tracing = screen_tui_trace_enabled();
++    monotonic_t trace_started = tracing ? monotonic() : 0;
++    monotonic_t trace_map = 0, trace_cpu = 0, trace_unmap = 0;
++    unsigned trace_rows = 0;
+     ensure_sprite_map(fonts_data);
++    monotonic_t trace_sprites_done = tracing ? monotonic() : 0;
+     const Cursor *cursor = screen->paused_rendering.expires_at ? &screen->paused_rendering.cursor : screen->cursor;
+ 
+     bool cursor_pos_changed = cursor->x != screen->last_rendered.cursor.x || cursor->y != screen->last_rendered.cursor.y;
+@@ -1135,15 +1287,24 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
+     {                                                                                                  \
          const unsigned int render_lines = render_lines_for_screen(screen);                             \
          sz = sizeof(GPUCell) * render_lines * screen->columns;                                         \
++        monotonic_t trace_phase = tracing ? monotonic() : 0;                                        \
          address = alloc_and_map_vao_buffer(vao_idx, sz, cell_data_buffer, true);                       \
 -        screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed); \
++        monotonic_t trace_mapped = tracing ? monotonic() : 0;                                       \
 +        screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed, sz); \
++        monotonic_t trace_updated = tracing ? monotonic() : 0;                                     \
          unmap_vao_buffer(vao_idx, cell_data_buffer);                                                   \
++        if (tracing) {                                                                             \
++            trace_map += trace_mapped - trace_phase;                                               \
++            trace_cpu += trace_updated - trace_mapped;                                             \
++            trace_unmap += monotonic() - trace_updated;                                            \
++            trace_rows += render_lines;                                                           \
++        }                                                                                         \
          address = NULL;                                                                                \
          changed = true;                                                                                \
      }
@@ -1790,7 +2658,21 @@ index 5cb7cf637..764f4cb57 100644
      } else if (screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || (disable_ligatures && cursor_pos_changed))
          update_cell_data;
  
-@@ -1909,6 +2027,8 @@ current_framebuffer_is_ok(void) {
+@@ -1188,6 +1349,13 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
+     screen->last_rendered.columns = screen->columns;
+     screen->last_rendered.lines = screen->lines;
+     screen->last_rendered.cursor = screen->cursor_render_info;
++    if (tracing) {
++        monotonic_t trace_finished = monotonic();
++        screen_tui_trace("{\"event\":\"render_phase\",\"phase\":\"prepare_cells\",\"time\":%.9f,\"window\":%llu,\"os_window\":%llu,\"duration_ms\":%.6g,\"sprite_bind_ms\":%.6g,\"cell_map_ms\":%.6g,\"cell_update_cpu_ms\":%.6g,\"cell_unmap_ms\":%.6g,\"updated_rows\":%u,\"changed\":%s}\n",
++            monotonic_t_to_s_double(trace_started), (unsigned long long)screen->window_id, (unsigned long long)os_window,
++            monotonic_t_to_s_double(trace_finished - trace_started) * 1000., monotonic_t_to_s_double(trace_sprites_done - trace_started) * 1000.,
++            monotonic_t_to_s_double(trace_map) * 1000., monotonic_t_to_s_double(trace_cpu) * 1000., monotonic_t_to_s_double(trace_unmap) * 1000., trace_rows, changed ? "true" : "false");
++    }
+ 
+     return changed;
+ }
+@@ -1909,6 +2077,8 @@ current_framebuffer_is_ok(void) {
  
  enum { DRAW_NEITHER_BG = 0, DRAW_DEFAULT_BG = 1, DRAW_NON_DEFAULT_BG = 2, DRAW_BOTH_BG = 3 };
  
@@ -1799,7 +2681,7 @@ index 5cb7cf637..764f4cb57 100644
  static void
  call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output, unsigned draw_bg_bitfield) {
      bind_program(program);
-@@ -1917,7 +2037,81 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
+@@ -1917,7 +2087,81 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
      bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
      glUniform1ui(program_uniform_location(program, "draw_bg_bitfield"), draw_bg_bitfield);
      if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
@@ -1882,10 +2764,35 @@ index 5cb7cf637..764f4cb57 100644
      if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
  }
  
-@@ -2264,6 +2458,16 @@ draw_cells(
+@@ -2202,7 +2446,7 @@ bool
+ send_cell_data_to_gpu(ssize_t vao_idx, Screen *screen, OSWindow *os_window) {
+     bool changed = false;
+     if (os_window->fonts_data) {
+-        if (cell_prepare_to_render(vao_idx, screen, os_window->fonts_data)) changed = true;
++        if (cell_prepare_to_render(vao_idx, screen, os_window->fonts_data, os_window->id)) changed = true;
+     }
+     return changed;
+ }
+@@ -2231,6 +2475,8 @@ draw_cells(
+                                                                                                                                     : inactive_text_alpha);
+     float bg_alpha = effective_os_window_alpha(os_window);
+ 
++    const bool trace_draw = screen_tui_trace_enabled();
++    monotonic_t trace_draw_started = trace_draw ? monotonic() : 0;
+     color_type default_bg = cell_update_uniform_block(
+         srd->vao_idx, screen, uniform_buffer, color_table_buffer, &screen->cursor_render_info, os_window, current_inactive_text_alpha, bg_alpha);
+     set_cell_uniforms(screen->reload_all_gpu_data);
+@@ -2262,8 +2508,23 @@ draw_cells(
+     };
+     screen->reload_all_gpu_data = false;
      save_viewport_using_top_left_origin(ui.screen_left, ui.screen_top, ui.screen_width, ui.screen_height, ui.full_framebuffer_height);
++    monotonic_t trace_draw_cells_started = trace_draw ? monotonic() : 0;
      if (ui.os_window->needs_layers) draw_cells_with_layers(&ui, srd->vao_idx);
      else draw_cells_without_layers(&ui, srd->vao_idx);
++    if (trace_draw) screen_tui_trace("{\"event\":\"render_phase\",\"phase\":\"draw_cells\",\"time\":%.9f,\"window\":%llu,\"os_window\":%llu,\"prepare_uniforms_ms\":%.6g,\"submit_ms\":%.6g,\"layered\":%s,\"native_rows\":%u,\"retained_rows\":%u,\"frozen\":%s}\n",
++        monotonic_t_to_s_double(trace_draw_started), (unsigned long long)screen->window_id, (unsigned long long)os_window->id,
++        monotonic_t_to_s_double(trace_draw_cells_started - trace_draw_started) * 1000., monotonic_t_to_s_double(monotonic() - trace_draw_cells_started) * 1000.,
++        ui.os_window->needs_layers ? "true" : "false", screen_tui_layer_rows(screen), screen_tui_pane_retained_rows(screen), screen->paused_rendering.expires_at ? "true" : "false");
 +    // Rendered frame intervals, not monitor presentation timestamps.
 +    if (screen_tui_pane_retained_rows(screen) || screen->tui_scroll.started_at || screen->tui_scene.snapshot || screen_tui_windows_active(screen) || screen->tui_scene.cursor_moving) {
 +        if (screen->tui_scene.frame_at && now - screen->tui_scene.frame_at < ms_to_monotonic_t(150)) {

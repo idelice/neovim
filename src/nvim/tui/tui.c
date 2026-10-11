@@ -2218,11 +2218,11 @@ static void patch_terminfo_bugs(TUIData *tui, const char *term, const char *colo
 
   const char *fix_normal = tui->ti.defs[kTerm_cursor_normal];
   if (fix_normal) {
-    if (STARTS_WITH(fix_normal, "\x1b[?12l")) {
-      // terminfo typically includes DECRST 12 as part of setting up the
-      // normal cursor, which interferes with the user's control via
-      // set_cursor_style.  When DECRST 12 is present, skip over it, but honor
-      // the rest of the cnorm setting.
+    if (STARTS_WITH(fix_normal, "\x1b[?12l") || STARTS_WITH(fix_normal, "\x1b[?12h")) {
+      // cnorm can reset OR enable blinking before showing the cursor. Both
+      // override the mode's DECSCUSR style, including when flush_buf restores
+      // visibility after a busy buffer switch. Preserve only the visibility
+      // command so guicursor remains authoritative.
       fix_normal += sizeof "\x1b[?12l" - 1;
       terminfo_set_str(tui, kTerm_cursor_normal, fix_normal);
     }
